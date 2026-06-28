@@ -1,0 +1,60 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "A user profile.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "timestamp" }
+      },
+      "required": ["email", "createdAt"]
+    },
+    "GenerationHistory": {
+      "title": "Generation History",
+      "description": "A history of TTS generations for a user.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "text": { "type": "string" },
+        "dialect": { "type": "string" },
+        "style": { "type": "string" },
+        "voice": { "type": "string" },
+        "speed": { "type": "number" },
+        "pitch": { "type": "number" },
+        "emotion": { "type": "string" },
+        "audioUrl": { "type": "string" },
+        "createdAt": { "type": "timestamp" }
+      },
+      "required": ["userId", "text", "dialect", "style", "voice", "audioUrl", "createdAt"]
+    },
+    "PayPalSettings": {
+      "title": "PayPal Settings",
+      "description": "PayPal API credentials and environment configuration.",
+      "type": "object",
+      "properties": {
+        "clientId": { "type": "string" },
+        "clientSecret": { "type": "string" },
+        "mode": { "type": "string" },
+        "updatedAt": { "type": "timestamp" }
+      },
+      "required": ["clientId", "clientSecret", "mode"]
+    }
+  },
+  "firestore": {
+    "/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/PayPalSettings" },
+      "description": "Platform settings stored securely."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profile data."
+    },
+    "/users/{userId}/history/{historyId}": {
+      "schema": { "$ref": "#/entities/GenerationHistory" },
+      "description": "User's TTS generation history."
+    }
+  }
+}

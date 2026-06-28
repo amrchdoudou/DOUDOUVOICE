@@ -1,0 +1,6 @@
+{
+  "name": "DoudouVoice",
+  "description": "AI-powered Arabic voice generation platform with multiple dialects and accents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
