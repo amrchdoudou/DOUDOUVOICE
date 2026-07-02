@@ -5,9 +5,12 @@ import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality } from "@google/genai";
 import { initializeApp } from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { getFirestoreDocREST, updateFirestoreDocREST } from "./src/lib/firestoreRest";
 import { getAuth } from "firebase-admin/auth";
 import firebaseConfig from "./firebase-applet-config.json";
+
+console.log("[DEBUG] projectId:", firebaseConfig.projectId, "| databaseId:", firebaseConfig.firestoreDatabaseId);
 
 const adminApp = initializeApp({
   projectId: firebaseConfig.projectId,
@@ -186,7 +189,45 @@ async function startServer() {
   // API Routes
   app.post("/api/tts", async (req, res) => {
     try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Missing or invalid Authorization header. Please log in again." });
+      }
+      const idToken = authHeader.split("Bearer ")[1];
+      let decodedToken;
+      try {
+        decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+      } catch (err: any) {
+        return res.status(401).json({ error: `Authentication failed: ${err.message}` });
+      }
+      const uid = decodedToken.uid;
+
       const { text, dialect, style, voice, speed, pitch, emotion } = req.body;
+      if (!text || typeof text !== "string") {
+        return res.status(400).json({ error: "Text is required and must be a string." });
+      }
+
+      // Fetch user profile via REST API bypassing IAM
+      const userData: any = await getFirestoreDocREST("users", uid, idToken) || { plan: "Free", generationCount: 0, usedCharacters: 0 };
+
+      const plan = (userData?.plan || "Free").toLowerCase();
+      const generationCount = userData?.generationCount || 0;
+      const usedCharacters = userData?.usedCharacters || 0;
+
+      // Plan rules and quota enforcement
+      if (plan === "free" && generationCount >= 5) {
+        return res.status(403).json({
+          error: "⚠️ خطأ في التوليد\n\nYou have exceeded the daily Free Tier limit of 5 speech generations. Please upgrade your plan in pricing section to continue generating."
+        });
+      }
+
+      const limitCharacters = userData?.limitCharacters || (plan === 'pro' ? 50000 : plan === 'business' ? 200000 : 10000);
+      if (plan !== "free" && (usedCharacters + text.length) > limitCharacters) {
+        const uppercasePlan = plan.charAt(0).toUpperCase() + plan.slice(1);
+        return res.status(403).json({
+          error: `لقد تجاوزت الحد الأقصى للحروف المسموح به لخطة ${uppercasePlan} (${limitCharacters.toLocaleString()} حرف). يرجى ترقية خطتك لمواصلة التوليد.`
+        });
+      }
       
       const apiKeys = getGeminiApiKeys();
       if (apiKeys.length === 0) {
@@ -257,7 +298,7 @@ Text: ${text}`;
             console.warn(`[Gemini TTS] Key ${keyObj.name} failed with quota/key error: ${err.message}. Trying next key...`);
             continue;
           } else {
-            // Re-throw if it's a structural or request-level validation error
+            // Re-throw if it's a request-level validation error
             throw err;
           }
         }
@@ -283,6 +324,12 @@ Text: ${text}`;
       const filePath = path.join(cacheDir, `${fileId}.wav`);
       await fs.promises.writeFile(filePath, audioBuffer);
 
+      // Securely update user quota via REST API bypassing IAM
+      await updateFirestoreDocREST("users", uid, {
+        generationCount: generationCount + 1,
+        usedCharacters: usedCharacters + text.length
+      }, idToken);
+
       res.json({ audio: `/api/audio/${fileId}.wav` });
     } catch (error: any) {
       console.error("Error in /api/tts:", error);
@@ -307,34 +354,8 @@ Text: ${text}`;
       if (localSettings.clientSecret) clientSecret = localSettings.clientSecret;
       if (localSettings.mode) mode = localSettings.mode;
     } else {
-      // 2. If no local settings cache, try fetching from Firestore via Admin SDK
-      try {
-        const docRef = adminDb.collection("settings").doc("paypal");
-        const docSnap = await docRef.get();
-        if (docSnap.exists) {
-          const data = docSnap.data();
-          if (data?.clientId) {
-            clientId = data.clientId;
-          }
-          if (data?.clientSecret) {
-            clientSecret = data.clientSecret;
-          }
-          if (data?.mode) {
-            mode = data.mode;
-          }
-          // Write to local cache for subsequent calls
-          if (data?.clientId && data?.clientSecret) {
-            saveLocalPayPalSettings({
-              clientId: data.clientId,
-              clientSecret: data.clientSecret,
-              mode: data.mode || "sandbox",
-              updatedAt: new Date()
-            });
-          }
-        }
-      } catch (error) {
-        // Silently fall back to env or local cache without printing scary IAM errors
-      }
+      // 2. Firestore fetch skipped due to IAM permissions; rely on localSettings or env
+      // Silently fall back to env or local cache without printing scary IAM errors
     }
 
     const baseUrl = mode === "live" 
@@ -480,8 +501,9 @@ Text: ${text}`;
         return res.status(401).json({ error: "Missing or invalid Authorization header" });
       }
       const idToken = authHeader.split("Bearer ")[1];
+      let decodedToken;
       try {
-        await getAuth(adminApp).verifyIdToken(idToken);
+        decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
       } catch (err: any) {
         return res.status(401).json({ error: `Authentication failed: ${err.message}` });
       }
@@ -526,6 +548,18 @@ Text: ${text}`;
       });
 
       const data = await response.json();
+
+      if (response.ok && data.id) {
+        // Securely record order mapping to prevent plan spoofing
+        await updateFirestoreDocREST("pending_orders", data.id, {
+          uid: decodedToken.uid,
+          plan: plan,
+          price: price,
+          status: "PENDING"
+        }, idToken);
+        console.log(`[PayPal] Pending order registered securely: ${data.id} for user ${decodedToken.uid} [Plan: ${plan}]`);
+      }
+
       res.json(data);
     } catch (error: any) {
       console.error("Failed to create order:", error);
@@ -535,7 +569,26 @@ Text: ${text}`;
 
   app.post("/api/orders/:orderID/capture", async (req, res) => {
     try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Missing or invalid Authorization header" });
+      }
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+      const uid = decodedToken.uid;
+
       const { orderID } = req.params;
+
+      // Secure lookup: Retrieve the original order details from Firestore
+      const orderData: any = await getFirestoreDocREST("pending_orders", orderID, idToken);
+      if (!orderData) {
+        return res.status(404).json({ error: "Order record not found" });
+      }
+      if (orderData.uid !== uid) {
+        return res.status(403).json({ error: "Unauthorized access to this order" });
+      }
+
+      const plan = orderData.plan;
       const { baseUrl } = await getPayPalCredentials();
       const accessToken = await generatePayPalAccessToken();
 
@@ -548,6 +601,29 @@ Text: ${text}`;
       });
 
       const data = await response.json();
+
+      if (response.ok && data.status === "COMPLETED") {
+        let limitCharacters = 10000;
+        const lowerPlan = plan.toLowerCase();
+        if (lowerPlan === 'pro') limitCharacters = 50000;
+        else if (lowerPlan === 'business') limitCharacters = 200000;
+        else if (lowerPlan === 'starter') limitCharacters = 10000;
+
+        await updateFirestoreDocREST("users", uid, {
+          plan: plan.charAt(0).toUpperCase() + plan.slice(1),
+          generationCount: 0,
+          limitCharacters: limitCharacters,
+          usedCharacters: 0
+        }, idToken);
+
+        // Clean up or keep history
+        await updateFirestoreDocREST("pending_orders", orderID, {
+          status: "COMPLETED"
+        }, idToken);
+
+        console.log(`[PayPal] Successfully captured payment and upgraded user ${uid} to plan ${plan}`);
+      }
+
       res.json(data);
     } catch (error: any) {
       console.error("Failed to capture order:", error);

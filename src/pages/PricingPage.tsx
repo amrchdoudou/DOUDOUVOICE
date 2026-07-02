@@ -4,8 +4,6 @@ import { useNavigate } from 'react-router-dom';
 import { useLanguage } from '../lib/LanguageContext';
 import { useAuth } from '../lib/AuthContext';
 import { PayPalButtons, usePayPalScriptReducer } from '@paypal/react-paypal-js';
-import { doc, updateDoc } from 'firebase/firestore';
-import { db } from '../lib/firebase';
 
 const TIERS = [
   {
@@ -92,30 +90,6 @@ export default function PricingPage() {
     setSelectedPlan(plan);
   };
 
-  const handlePaymentSuccess = async (plan: string) => {
-    if (!user) return;
-    try {
-      let limitCharacters = 10000;
-      const lowerPlan = plan.toLowerCase();
-      if (lowerPlan === 'pro') limitCharacters = 50000;
-      else if (lowerPlan === 'business') limitCharacters = 200000;
-      else if (lowerPlan === 'starter') limitCharacters = 10000;
-
-      await updateDoc(doc(db, 'users', user.uid), {
-        plan: plan.charAt(0).toUpperCase() + plan.slice(1),
-        generationCount: 0, // Reset generation count on upgrade
-        limitCharacters: limitCharacters,
-        usedCharacters: 0 // Reset characters so they start fresh on their new billing cycle
-      });
-      alert(t('payment_success'));
-      setSelectedPlan(null);
-      setPaymentError(null);
-    } catch (error) {
-      console.error("Error updating plan:", error);
-      alert(t('payment_failed'));
-    }
-  };
-
   const createOrder = async (data: any, actions: any) => {
     try {
       setPaymentError(null);
@@ -146,9 +120,14 @@ export default function PricingPage() {
   const onApprove = async (data: any, actions: any) => {
     try {
       setPaymentError(null);
+      const token = user ? await user.getIdToken() : "";
       const response = await fetch(`/api/orders/${data.orderID}/capture`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({})
       });
       const orderData = await response.json();
       const errorDetail = orderData?.details?.[0];
@@ -161,7 +140,9 @@ export default function PricingPage() {
         throw new Error(orderData.error);
       } else {
         // Capture successful
-        await handlePaymentSuccess(selectedPlan!);
+        alert(t('payment_success'));
+        setSelectedPlan(null);
+        setPaymentError(null);
       }
     } catch (error: any) {
       console.error("Capture Order Error:", error);
@@ -247,24 +228,6 @@ export default function PricingPage() {
             <div className="mb-6">
               <p className="text-white/60 mb-2">{t('upgrade_to')} <strong className="text-white uppercase">{t(selectedPlan)}</strong> {t('plan_word')}</p>
               <p className="text-2xl font-bold text-brand-500 mb-6">{TIERS.find(t => t.name === selectedPlan)?.price} <span className="text-sm font-normal text-white/40">{t('per_month')}</span></p>
-            </div>
-
-            <div className="mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 text-xs text-white">
-              <div className="flex gap-3">
-                <span className="text-base select-none">🧪</span>
-                <div className="flex-1">
-                  <h4 className="font-bold text-amber-400 mb-1">Sandbox / Test Mode Option</h4>
-                  <p className="text-white/70 leading-relaxed mb-3">
-                    If PayPal Sandbox blocks your test card with compliance or self-payment errors, you can instantly upgrade using this fast simulation button:
-                  </p>
-                  <button
-                    onClick={() => handlePaymentSuccess(selectedPlan!)}
-                    className="w-full flex items-center justify-center gap-2 rounded-lg bg-amber-500 hover:bg-amber-400 active:scale-95 px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-black transition-all shadow-[0_4px_12px_rgba(245,158,11,0.25)]"
-                  >
-                    ⚡ Fast Sandbox Upgrade Bypass
-                  </button>
-                </div>
-              </div>
             </div>
 
             {paymentError && (

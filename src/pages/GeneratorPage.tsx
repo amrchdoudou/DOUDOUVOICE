@@ -84,9 +84,13 @@ export default function GeneratorPage() {
       audioRef.current.pause();
     }
     try {
+      const token = user ? await user.getIdToken() : "";
       const res = await fetch('/api/tts', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({
           text, dialect, style, voice, speed, pitch, emotion
         })
@@ -98,11 +102,6 @@ export default function GeneratorPage() {
       setAudioUrl(data.audio);
       
       if (user) {
-        await setDoc(doc(db, 'users', user.uid), {
-          generationCount: (userData?.generationCount || 0) + 1,
-          usedCharacters: (userData?.usedCharacters || 0) + text.length
-        }, { merge: true });
-
         const historyDocRef = await addDoc(collection(db, 'users', user.uid, 'history'), {
           userId: user.uid,
           text,
