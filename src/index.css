@@ -14,11 +14,140 @@
   --color-brand-950: #451a03;
 }
 
+@variant light (&:where(.light, .light *));
+
 @layer base {
   body {
-    @apply bg-[#050505] text-[#e0e0e0] antialiased font-sans flex flex-col h-screen overflow-hidden m-0;
+    @apply bg-[#050505] text-[#e0e0e0] antialiased font-sans flex flex-col h-screen overflow-hidden m-0 transition-colors duration-200;
   }
   #root {
     @apply flex flex-col h-full flex-1 overflow-hidden;
   }
 }
+
+/* Elegant Light Mode Styles and overrides */
+.light {
+  background-color: #f9f9fb !important;
+  color: #171717 !important;
+}
+
+.light body {
+  background-color: #f9f9fb !important;
+  color: #171717 !important;
+}
+
+/* Map hardcoded background colors for Light Mode */
+.light .bg-\[\#050505\] {
+  background-color: #f9f9fb !important;
+}
+
+.light .bg-\[\#0a0a0a\] {
+  background-color: #ffffff !important;
+}
+
+.light .bg-\[\#080808\] {
+  background-color: #f3f4f6 !important;
+}
+
+.light .bg-\[\#111\] {
+  background-color: #e5e7eb !important;
+}
+
+.light .bg-[#0a0a0a]/95 {
+  background-color: rgba(255, 255, 255, 0.95) !important;
+}
+
+/* Translucent components mapping */
+.light .bg-white\/5 {
+  background-color: rgba(0, 0, 0, 0.05) !important;
+}
+
+.light .bg-white\/10 {
+  background-color: rgba(0, 0, 0, 0.08) !important;
+}
+
+.light .bg-white\/\[0\.02\] {
+  background-color: rgba(0, 0, 0, 0.02) !important;
+}
+
+.light .hover\:bg-white\/10:hover {
+  background-color: rgba(0, 0, 0, 0.08) !important;
+}
+
+.light .hover\:bg-white\/\[0\.04\]:hover {
+  background-color: rgba(0, 0, 0, 0.04) !important;
+}
+
+/* Border adjustments */
+.light .border-white\/10 {
+  border-color: rgba(0, 0, 0, 0.1) !important;
+}
+
+.light .border-white\/5 {
+  border-color: rgba(0, 0, 0, 0.06) !important;
+}
+
+/* Text color adjustments for light background contrast */
+.light .text-white {
+  color: #111111 !important;
+}
+
+.light .text-\[\#e0e0e0\] {
+  color: #1f2937 !important;
+}
+
+.light .text-white\/80 {
+  color: #1f2937 !important;
+}
+
+.light .text-white\/70 {
+  color: #374151 !important;
+}
+
+.light .text-white\/60 {
+  color: #4b5563 !important;
+}
+
+.light .text-white\/40 {
+  color: #6b7280 !important;
+}
+
+.light .text-white\/30 {
+  color: #9ca3af !important;
+}
+
+/* Brand styling preserves or enhancements */
+.light .bg-brand-500 {
+  background-color: #f59e0b !important;
+  color: #000000 !important;
+}
+
+.light .bg-brand-500\/10 {
+  background-color: rgba(245, 158, 11, 0.1) !important;
+}
+
+.light .text-brand-400,
+.light .text-brand-500 {
+  color: #d97706 !important;
+}
+
+/* Hero Section Radial Gradient adjustment for warm light theme contrast */
+.light .relative.overflow-hidden .absolute.inset-0 {
+  background-image: radial-gradient(ellipse at top, rgba(245, 158, 11, 0.12), #f9f9fb, #f9f9fb) !important;
+}
+
+/* Input, textareas, and select elements */
+.light input,
+.light textarea,
+.light select {
+  background-color: #ffffff !important;
+  color: #111111 !important;
+  border-color: rgba(0, 0, 0, 0.15) !important;
+}
+
+/* Shadow adjustments */
+.light .shadow-black {
+  --tw-shadow-color: rgba(0, 0, 0, 0.05) !important;
+  box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05), 0 4px 6px -4px rgba(0,0,0,0.05) !important;
+}
+

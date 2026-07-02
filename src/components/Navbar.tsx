@@ -2,13 +2,15 @@ import { useState } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../lib/AuthContext';
 import { useLanguage } from '../lib/LanguageContext';
+import { useTheme } from '../lib/ThemeContext';
 import { signInWithGoogle, logOut } from '../lib/firebase';
-import { LogOut, User, Globe, Menu, X, Mic, CreditCard, History, LayoutDashboard } from 'lucide-react';
+import { LogOut, User, Globe, Menu, X, Mic, CreditCard, History, LayoutDashboard, Sun, Moon } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 export default function Navbar() {
   const { user } = useAuth();
   const { language, setLanguage, t } = useLanguage();
+  const { theme, toggleTheme } = useTheme();
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
@@ -83,6 +85,14 @@ export default function Navbar() {
 
       {/* Desktop Controls (hidden on mobile) */}
       <div className="hidden md:flex items-center gap-4">
+        <button
+          onClick={toggleTheme}
+          className="flex items-center gap-2 text-white/60 hover:text-white transition-colors p-2 rounded-full hover:bg-white/5"
+          title={theme === 'light' ? 'Dark Mode' : 'Light Mode'}
+        >
+          {theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}
+        </button>
+
         <button 
           onClick={toggleLanguage}
           className="flex items-center gap-2 text-white/60 hover:text-white transition-colors text-xs font-bold uppercase tracking-widest"
@@ -199,6 +209,20 @@ export default function Navbar() {
 
             {/* Quick Actions */}
             <div className="flex flex-col gap-2">
+              {/* Theme Switcher */}
+              <button
+                onClick={toggleTheme}
+                className="w-full flex items-center justify-between px-4 py-3 rounded text-sm text-white/70 hover:text-white hover:bg-white/5 transition-colors"
+              >
+                <div className="flex items-center gap-3.5">
+                  {theme === 'light' ? <Moon size={18} className="text-white/40" /> : <Sun size={18} className="text-white/40" />}
+                  <span>{theme === 'light' ? 'Dark Mode' : 'Light Mode'}</span>
+                </div>
+                <span className="text-xs bg-white/10 px-2.5 py-1 rounded text-white font-mono uppercase font-bold tracking-widest">
+                  {theme === 'light' ? 'DARK' : 'LIGHT'}
+                </span>
+              </button>
+
               {/* Language Switcher */}
               <button
                 onClick={toggleLanguage}

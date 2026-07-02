@@ -6,6 +6,7 @@
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { AuthProvider } from './lib/AuthContext';
 import { LanguageProvider } from './lib/LanguageContext';
+import { ThemeProvider } from './lib/ThemeContext';
 import { PayPalScriptProvider } from '@paypal/react-paypal-js';
 import Navbar from './components/Navbar';
 import LandingPage from './pages/LandingPage';
@@ -28,11 +29,12 @@ const paypalOptions = {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <LanguageProvider>
-        <PayPalScriptProvider options={paypalOptions}>
-          <Router>
-            <div className="flex h-full w-full flex-col bg-[#050505] text-[#e0e0e0]">
+    <ThemeProvider>
+      <AuthProvider>
+        <LanguageProvider>
+          <PayPalScriptProvider options={paypalOptions}>
+            <Router>
+              <div className="flex h-full w-full flex-col bg-[#050505] light:bg-[#f9f9fb] text-[#e0e0e0] light:text-[#171717]">
               <Navbar />
               <main className="flex-1 flex overflow-hidden">
                 <div className="w-full h-full overflow-y-auto">
@@ -52,5 +54,6 @@ export default function App() {
         </PayPalScriptProvider>
       </LanguageProvider>
     </AuthProvider>
+    </ThemeProvider>
   );
 }
