@@ -3,8 +3,6 @@ import { motion } from 'motion/react';
 import { Play, Pause, Download, Loader2, Settings2, History } from 'lucide-react';
 import { useAuth } from '../lib/AuthContext';
 import { useLanguage } from '../lib/LanguageContext';
-import { db } from '../lib/firebase';
-import { collection, addDoc, serverTimestamp, doc, setDoc, Bytes } from 'firebase/firestore';
 import { getDialectFlag } from '../lib/utils';
 
 const DIALECTS = [
@@ -39,7 +37,7 @@ const VOICES = {
 };
 
 export default function GeneratorPage() {
-  const { user, userData } = useAuth();
+  const { user, userData, refreshUserData } = useAuth();
   const { t } = useLanguage();
   const [text, setText] = useState('');
   const [dialect, setDialect] = useState(DIALECTS[0]);
@@ -102,39 +100,24 @@ export default function GeneratorPage() {
       setAudioUrl(data.audio);
       
       if (user) {
-        const historyDocRef = await addDoc(collection(db, 'users', user.uid, 'history'), {
-          userId: user.uid,
-          text,
-          dialect,
-          style,
-          voice,
-          speed,
-          pitch,
-          emotion,
-          audioUrl: data.audio,
-          createdAt: serverTimestamp()
-        });
-
-        // Slice the audio into persistent chunks and save to subcollection
         try {
-          const audioRes = await fetch(data.audio);
-          const arrayBuffer = await audioRes.arrayBuffer();
-          const bytes = new Uint8Array(arrayBuffer);
-          
-          const chunkSize = 500 * 1024; // 500KB per chunk
-          let index = 0;
-          for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-            const chunkBytes = bytes.slice(offset, offset + chunkSize);
-            const chunkData = Bytes.fromUint8Array(chunkBytes);
-            
-            await setDoc(doc(db, 'users', user.uid, 'history', historyDocRef.id, 'chunks', index.toString()), {
-              index,
-              data: chunkData
-            });
-            index++;
-          }
-        } catch (uploadError) {
-          console.error("Error saving persistent audio chunks:", uploadError);
+          const idToken = await user.getIdToken();
+          await fetch('/api/history', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${idToken}`
+            },
+            body: JSON.stringify({
+              text,
+              language: dialect,
+              voice,
+              audioUrl: data.audio
+            })
+          });
+          refreshUserData();
+        } catch (e) {
+          console.error("Failed to save history:", e);
         }
       }
     } catch (err: any) {

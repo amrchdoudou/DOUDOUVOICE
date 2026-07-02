@@ -1,8 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { useAuth } from '../lib/AuthContext';
-import { db } from '../lib/firebase';
-import { collection, query, orderBy, getDocs, doc, getDoc, setDoc } from 'firebase/firestore';
 import { Users } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
@@ -28,25 +26,6 @@ export default function DashboardPage() {
     setIsSaving(true);
     setTestResult(null);
     try {
-      let actualSecret = paypalSecret;
-      const docRef = doc(db, 'settings', 'paypal');
-
-      if (paypalSecret.includes('•')) {
-        const docSnap = await getDoc(docRef);
-        if (docSnap.exists()) {
-          actualSecret = docSnap.data().clientSecret || paypalSecret;
-        }
-      }
-
-      // 1. Save directly to Firestore using client-side SDK with authenticated admin session
-      await setDoc(docRef, {
-        clientId: paypalClientId,
-        clientSecret: actualSecret,
-        mode: paypalMode,
-        updatedAt: new Date()
-      });
-
-      // 2. Synchronize to server's local file storage cache
       const idToken = await user?.getIdToken();
       const response = await fetch('/api/paypal/save', {
         method: 'POST',
@@ -54,7 +33,7 @@ export default function DashboardPage() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${idToken}`
         },
-        body: JSON.stringify({ clientId: paypalClientId, clientSecret: actualSecret, mode: paypalMode })
+        body: JSON.stringify({ clientId: paypalClientId, clientSecret: paypalSecret, mode: paypalMode })
       });
       const data = await response.json();
       if (response.ok) {
@@ -75,25 +54,6 @@ export default function DashboardPage() {
     setIsTesting(true);
     setTestResult(null);
     try {
-      let actualSecret = paypalSecret;
-      const docRef = doc(db, 'settings', 'paypal');
-
-      if (paypalSecret.includes('•')) {
-        const docSnap = await getDoc(docRef);
-        if (docSnap.exists()) {
-          actualSecret = docSnap.data().clientSecret || paypalSecret;
-        }
-      }
-
-      // 1. Save directly to Firestore using client-side SDK first
-      await setDoc(docRef, {
-        clientId: paypalClientId,
-        clientSecret: actualSecret,
-        mode: paypalMode,
-        updatedAt: new Date()
-      });
-
-      // 2. Perform server-side validation and local caching
       const idToken = await user?.getIdToken();
       const response = await fetch('/api/paypal/test', {
         method: 'POST',
@@ -101,7 +61,7 @@ export default function DashboardPage() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${idToken}`
         },
-        body: JSON.stringify({ clientId: paypalClientId, clientSecret: actualSecret, mode: paypalMode })
+        body: JSON.stringify({ clientId: paypalClientId, clientSecret: paypalSecret, mode: paypalMode })
       });
       const data = await response.json();
       if (response.ok) {
@@ -125,76 +85,30 @@ export default function DashboardPage() {
 
     const fetchPayPalSettings = async () => {
       try {
-        // 1. Try fetching directly from Cloud Firestore via client SDK (works securely for authenticated admin)
-        const docRef = doc(db, 'settings', 'paypal');
-        const docSnap = await getDoc(docRef);
-        if (docSnap.exists()) {
-          const data = docSnap.data();
+        const response = await fetch('/api/paypal/config');
+        if (response.ok) {
+          const data = await response.json();
           if (data.clientId) setPaypalClientId(data.clientId);
-          if (data.clientSecret) setPaypalSecret('••••••••••••••••••••••••••••••••••••••••');
+          if (data.hasSecret) setPaypalSecret('••••••••••••••••••••••••••••••••••••••••');
           if (data.mode) setPaypalMode(data.mode);
-
-          // Synchronize/Restore backend server file storage cache
-          const idToken = await user?.getIdToken();
-          await fetch('/api/paypal/save', {
-            method: 'POST',
-            headers: { 
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${idToken}`
-            },
-            body: JSON.stringify({ clientId: data.clientId, clientSecret: data.clientSecret, mode: data.mode })
-          });
-        } else {
-          // Fall back to server's env variables if Firestore document is empty
-          const response = await fetch('/api/paypal/config');
-          if (response.ok) {
-            const data = await response.json();
-            if (data.clientId) setPaypalClientId(data.clientId);
-            if (data.hasSecret) setPaypalSecret('••••••••••••••••••••••••••••••••••••••••');
-            if (data.mode) setPaypalMode(data.mode);
-          }
         }
       } catch (error) {
-        console.error("Error loading/syncing PayPal settings:", error);
-        // Direct fallback to server
-        try {
-          const response = await fetch('/api/paypal/config');
-          if (response.ok) {
-            const data = await response.json();
-            if (data.clientId) setPaypalClientId(data.clientId);
-            if (data.hasSecret) setPaypalSecret('••••••••••••••••••••••••••••••••••••••••');
-            if (data.mode) setPaypalMode(data.mode);
-          }
-        } catch (serverErr) {
-          console.error("Server config fallback failed:", serverErr);
-        }
+        console.error("Error loading PayPal settings:", error);
       }
     };
 
     const fetchUsers = async () => {
       try {
-        const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'));
-        const snapshot = await getDocs(q);
-        const usersData = snapshot.docs.map(doc => {
-          const data = doc.data();
-          const plan = data.plan || 'Free';
-          let defaultLimit = 10000;
-          if (plan.toLowerCase() === 'pro') {
-            defaultLimit = 50000;
-          } else if (plan.toLowerCase() === 'business') {
-            defaultLimit = 200000;
-          } else if (plan.toLowerCase() === 'starter' || plan.toLowerCase() === 'free') {
-            defaultLimit = 10000;
+        const idToken = await user?.getIdToken();
+        const response = await fetch('/api/admin/users', {
+          headers: {
+            'Authorization': `Bearer ${idToken}`
           }
-          return {
-            id: doc.id,
-            ...data,
-            plan: plan.charAt(0).toUpperCase() + plan.slice(1),
-            usedCharacters: data.usedCharacters || 0,
-            limitCharacters: data.limitCharacters || defaultLimit
-          };
         });
-        setAllUsers(usersData);
+        if (response.ok) {
+          const data = await response.json();
+          setAllUsers(data);
+        }
       } catch (error) {
         console.error("Error fetching users:", error);
       } finally {

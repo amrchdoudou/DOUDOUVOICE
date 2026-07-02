@@ -5,17 +5,17 @@ import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality } from "@google/genai";
 import { initializeApp } from "firebase-admin/app";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
-import { getFirestoreDocREST, updateFirestoreDocREST } from "./src/lib/firestoreRest";
 import { getAuth } from "firebase-admin/auth";
 import firebaseConfig from "./firebase-applet-config.json";
+import { db } from "./src/db/index.js";
+import { users, pendingOrders, history } from "./src/db/schema.js";
+import { eq } from "drizzle-orm";
 
-console.log("[DEBUG] projectId:", firebaseConfig.projectId, "| databaseId:", firebaseConfig.firestoreDatabaseId);
+console.log("[DEBUG] projectId:", firebaseConfig.projectId);
 
 const adminApp = initializeApp({
   projectId: firebaseConfig.projectId,
 });
-const adminDb = getFirestore(adminApp, firebaseConfig.firestoreDatabaseId);
 
 const PAYPAL_SETTINGS_FILE = path.join(process.cwd(), "paypal_settings.json");
 
@@ -186,6 +186,123 @@ async function startServer() {
     return uniqueKeys;
   }
 
+  // Get current user data
+  app.get("/api/user", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+      
+      const userRecords = await db.select().from(users).where(eq(users.uid, decodedToken.uid));
+      if (userRecords.length > 0) {
+        res.json(userRecords[0]);
+      } else {
+        res.json(null);
+      }
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Sync user data on login
+  app.post("/api/user", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+      
+      const { email, displayName, photoURL } = req.body;
+      const userRecords = await db.select().from(users).where(eq(users.uid, decodedToken.uid));
+      if (userRecords.length === 0) {
+        await db.insert(users).values({
+          uid: decodedToken.uid,
+          plan: 'Free',
+          generationCount: 0,
+          limitCharacters: 5000,
+          usedCharacters: 0,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+      }
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Admin users list
+  app.get("/api/admin/users", async (req, res) => {
+    try {
+      await verifyAdmin(req);
+      const allUsers = await db.select().from(users).orderBy(users.createdAt);
+      res.json(allUsers);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // History endpoints
+  app.get("/api/history", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+      
+      // Note: we can map the result to include id (already has id)
+      // The schema has history table. We need to order it by createdAt desc
+      // Wait, history.createdAt can be used in orderBy. We don't have orderBy imported here, so we will sort in memory.
+      const userHistory = await db.select().from(history).where(eq(history.uid, decodedToken.uid));
+      res.json(userHistory.sort((a, b) => {
+        const da = a.createdAt ? a.createdAt.getTime() : 0;
+        const db = b.createdAt ? b.createdAt.getTime() : 0;
+        return db - da; // Desc
+      }));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/history", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+      
+      const { text, language, voice, audioUrl } = req.body;
+      const historyId = crypto.randomUUID();
+      await db.insert(history).values({
+        id: historyId,
+        uid: decodedToken.uid,
+        text,
+        language,
+        voice,
+        audioUrl,
+        createdAt: new Date()
+      });
+      res.json({ id: historyId });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/history/:id", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+      
+      await db.delete(history).where(eq(history.id, req.params.id));
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // API Routes
   app.post("/api/tts", async (req, res) => {
     try {
@@ -207,8 +324,9 @@ async function startServer() {
         return res.status(400).json({ error: "Text is required and must be a string." });
       }
 
-      // Fetch user profile via REST API bypassing IAM
-      const userData: any = await getFirestoreDocREST("users", uid, idToken) || { plan: "Free", generationCount: 0, usedCharacters: 0 };
+      // Fetch user profile from PostgreSQL
+      const userRecords = await db.select().from(users).where(eq(users.uid, uid));
+      const userData = userRecords.length > 0 ? userRecords[0] : { plan: "Free", generationCount: 0, usedCharacters: 0, limitCharacters: 5000 };
 
       const plan = (userData?.plan || "Free").toLowerCase();
       const generationCount = userData?.generationCount || 0;
@@ -324,11 +442,22 @@ Text: ${text}`;
       const filePath = path.join(cacheDir, `${fileId}.wav`);
       await fs.promises.writeFile(filePath, audioBuffer);
 
-      // Securely update user quota via REST API bypassing IAM
-      await updateFirestoreDocREST("users", uid, {
-        generationCount: generationCount + 1,
-        usedCharacters: usedCharacters + text.length
-      }, idToken);
+      // Securely update user quota in PostgreSQL
+      await db.insert(users)
+        .values({
+          uid,
+          generationCount: generationCount + 1,
+          usedCharacters: usedCharacters + text.length,
+          updatedAt: new Date()
+        })
+        .onConflictDoUpdate({
+          target: users.uid,
+          set: {
+            generationCount: generationCount + 1,
+            usedCharacters: usedCharacters + text.length,
+            updatedAt: new Date()
+          }
+        });
 
       res.json({ audio: `/api/audio/${fileId}.wav` });
     } catch (error: any) {
@@ -354,8 +483,8 @@ Text: ${text}`;
       if (localSettings.clientSecret) clientSecret = localSettings.clientSecret;
       if (localSettings.mode) mode = localSettings.mode;
     } else {
-      // 2. Firestore fetch skipped due to IAM permissions; rely on localSettings or env
-      // Silently fall back to env or local cache without printing scary IAM errors
+      // 2. If no local settings cache, we just fall back to env or local cache
+      // because we migrated away from Firestore and settings are only stored locally now.
     }
 
     const baseUrl = mode === "live" 
@@ -551,12 +680,13 @@ Text: ${text}`;
 
       if (response.ok && data.id) {
         // Securely record order mapping to prevent plan spoofing
-        await updateFirestoreDocREST("pending_orders", data.id, {
+        await db.insert(pendingOrders).values({
+          id: data.id,
           uid: decodedToken.uid,
           plan: plan,
           price: price,
-          status: "PENDING"
-        }, idToken);
+          createdAt: new Date()
+        });
         console.log(`[PayPal] Pending order registered securely: ${data.id} for user ${decodedToken.uid} [Plan: ${plan}]`);
       }
 
@@ -579,11 +709,12 @@ Text: ${text}`;
 
       const { orderID } = req.params;
 
-      // Secure lookup: Retrieve the original order details from Firestore
-      const orderData: any = await getFirestoreDocREST("pending_orders", orderID, idToken);
-      if (!orderData) {
+      // Secure lookup: Retrieve the original order details from PostgreSQL
+      const orderRecords = await db.select().from(pendingOrders).where(eq(pendingOrders.id, orderID));
+      if (orderRecords.length === 0) {
         return res.status(404).json({ error: "Order record not found" });
       }
+      const orderData = orderRecords[0];
       if (orderData.uid !== uid) {
         return res.status(403).json({ error: "Unauthorized access to this order" });
       }
@@ -609,17 +740,31 @@ Text: ${text}`;
         else if (lowerPlan === 'business') limitCharacters = 200000;
         else if (lowerPlan === 'starter') limitCharacters = 10000;
 
-        await updateFirestoreDocREST("users", uid, {
-          plan: plan.charAt(0).toUpperCase() + plan.slice(1),
-          generationCount: 0,
-          limitCharacters: limitCharacters,
-          usedCharacters: 0
-        }, idToken);
+        const updatedPlan = plan.charAt(0).toUpperCase() + plan.slice(1);
+        await db.insert(users)
+          .values({
+            uid,
+            plan: updatedPlan,
+            generationCount: 0,
+            limitCharacters: limitCharacters,
+            usedCharacters: 0,
+            updatedAt: new Date()
+          })
+          .onConflictDoUpdate({
+            target: users.uid,
+            set: {
+              plan: updatedPlan,
+              generationCount: 0,
+              limitCharacters: limitCharacters,
+              usedCharacters: 0,
+              updatedAt: new Date()
+            }
+          });
 
         // Clean up or keep history
-        await updateFirestoreDocREST("pending_orders", orderID, {
-          status: "COMPLETED"
-        }, idToken);
+        await db.update(pendingOrders)
+          .set({ status: "COMPLETED", completedAt: new Date() })
+          .where(eq(pendingOrders.id, orderID));
 
         console.log(`[PayPal] Successfully captured payment and upgraded user ${uid} to plan ${plan}`);
       }

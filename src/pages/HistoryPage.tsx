@@ -1,8 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { useAuth } from '../lib/AuthContext';
 import { useLanguage } from '../lib/LanguageContext';
-import { db } from '../lib/firebase';
-import { collection, query, orderBy, getDocs, deleteDoc, doc, Bytes } from 'firebase/firestore';
 import { Play, Pause, Download, Trash2, Clock, Loader2 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { getDialectFlag } from '../lib/utils';
@@ -47,16 +45,17 @@ export default function HistoryPage() {
     if (!user) return;
     const fetchHistory = async () => {
       try {
-        const q = query(
-          collection(db, 'users', user.uid, 'history'),
-          orderBy('createdAt', 'desc')
-        );
-        const snapshot = await getDocs(q);
-        const data = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data()
-        })) as HistoryItem[];
-        setHistory(data);
+        const idToken = await user.getIdToken();
+        const response = await fetch('/api/history', {
+          headers: {
+            'Authorization': `Bearer ${idToken}`
+          }
+        });
+        if (response.ok) {
+          const data = await response.json();
+          // Map backend language field to dialect for frontend compatibility
+          setHistory(data.map((item: any) => ({ ...item, dialect: item.language })));
+        }
       } catch (error) {
         console.error("Error fetching history", error);
       } finally {
@@ -69,7 +68,13 @@ export default function HistoryPage() {
   const handleDelete = async (id: string) => {
     if (!user || !window.confirm(t('delete_recording'))) return;
     try {
-      await deleteDoc(doc(db, 'users', user.uid, 'history', id));
+      const idToken = await user.getIdToken();
+      await fetch(`/api/history/${id}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${idToken}`
+        }
+      });
       setHistory(prev => prev.filter(item => item.id !== id));
       if (loadedAudios[id]) {
         URL.revokeObjectURL(loadedAudios[id]);
@@ -85,47 +90,8 @@ export default function HistoryPage() {
   };
 
   const rebuildAudioFromChunks = async (historyId: string): Promise<string | null> => {
-    if (!user) return null;
-    try {
-      const chunksSnap = await getDocs(
-        query(
-          collection(db, 'users', user.uid, 'history', historyId, 'chunks'),
-          orderBy('index')
-        )
-      );
-      
-      if (chunksSnap.empty) {
-        console.warn("No persistent audio chunks found in Firestore for:", historyId);
-        return null;
-      }
-      
-      const chunkArrays: Uint8Array[] = [];
-      chunksSnap.docs.forEach(docSnap => {
-        const chunkData = docSnap.data();
-        if (chunkData.data && typeof chunkData.data.toUint8Array === 'function') {
-          const bytes = chunkData.data.toUint8Array();
-          chunkArrays.push(bytes);
-        }
-      });
-      
-      if (chunkArrays.length === 0) return null;
-
-      // Calculate total length
-      const totalLength = chunkArrays.reduce((sum, arr) => sum + arr.length, 0);
-      const combined = new Uint8Array(totalLength);
-      
-      let offset = 0;
-      chunkArrays.forEach(arr => {
-        combined.set(arr, offset);
-        offset += arr.length;
-      });
-      
-      const blob = new Blob([combined], { type: 'audio/wav' });
-      return URL.createObjectURL(blob);
-    } catch (err) {
-      console.error("Error rebuilding audio from chunks:", err);
-      return null;
-    }
+    // Left for backwards compatibility if needed, but not required for Postgres backend since we just use audioUrl directly.
+    return null;
   };
 
   const handleDownload = async (url: string, filename: string) => {

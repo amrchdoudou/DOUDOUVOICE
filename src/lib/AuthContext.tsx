@@ -1,7 +1,6 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { User, onAuthStateChanged } from 'firebase/auth';
-import { auth, db } from './firebase';
-import { doc, setDoc, getDoc, onSnapshot } from 'firebase/firestore';
+import { auth } from './firebase';
 
 interface UserData {
   plan: string;
@@ -13,65 +12,76 @@ interface AuthContextType {
   user: User | null;
   userData: UserData | null;
   loading: boolean;
+  refreshUserData: () => Promise<void>;
 }
 
-const AuthContext = createContext<AuthContextType>({ user: null, userData: null, loading: true });
+const AuthContext = createContext<AuthContextType>({ user: null, userData: null, loading: true, refreshUserData: async () => {} });
 
 export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
   const [user, setUser] = useState<User | null>(null);
   const [userData, setUserData] = useState<UserData | null>(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let unsubscribeSnapshot: () => void;
+  const fetchUserData = async (currentUser: User) => {
+    try {
+      const idToken = await currentUser.getIdToken();
+      // Ensure user exists on server
+      await fetch('/api/user', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        },
+        body: JSON.stringify({
+          email: currentUser.email,
+          displayName: currentUser.displayName,
+          photoURL: currentUser.photoURL
+        })
+      });
 
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      setUser(user);
-      if (user) {
-        // Create user document if it doesn't exist
-        try {
-          const userRef = doc(db, 'users', user.uid);
-          const docSnap = await getDoc(userRef);
-          
-          if (!docSnap.exists()) {
-            await setDoc(userRef, {
-              email: user.email,
-              displayName: user.displayName,
-              photoURL: user.photoURL,
-              plan: 'Free',
-              generationCount: 0,
-              createdAt: new Date(),
-            });
-          }
-
-          unsubscribeSnapshot = onSnapshot(userRef, (doc) => {
-            if (doc.exists()) {
-              const data = doc.data();
-              setUserData({
-                ...data,
-                plan: data.plan || 'Free',
-                generationCount: data.generationCount || 0
-              } as UserData);
-            }
-          });
-        } catch (error) {
-          console.error("Error creating/fetching user doc", error);
+      // Fetch user data
+      const res = await fetch('/api/user', {
+        headers: {
+          'Authorization': `Bearer ${idToken}`
         }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setUserData({
+          ...data,
+          plan: data?.plan || 'Free',
+          generationCount: data?.generationCount || 0
+        });
+      }
+    } catch (e) {
+      console.error("Error fetching user data", e);
+    }
+  };
+
+  const refreshUserData = async () => {
+    if (user) {
+      await fetchUserData(user);
+    }
+  };
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      if (currentUser) {
+        await fetchUserData(currentUser);
       } else {
         setUserData(null);
-        if (unsubscribeSnapshot) unsubscribeSnapshot();
       }
       setLoading(false);
     });
 
     return () => {
       unsubscribe();
-      if (unsubscribeSnapshot) unsubscribeSnapshot();
     };
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, userData, loading }}>
+    <AuthContext.Provider value={{ user, userData, loading, refreshUserData }}>
       {!loading && children}
     </AuthContext.Provider>
   );
