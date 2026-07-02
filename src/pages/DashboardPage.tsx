@@ -175,14 +175,25 @@ export default function DashboardPage() {
       try {
         const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'));
         const snapshot = await getDocs(q);
-        const usersData = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-          // Default values if they don't exist in the DB yet
-          plan: doc.data().plan || 'Starter',
-          usedCharacters: doc.data().usedCharacters || 0,
-          limitCharacters: doc.data().limitCharacters || 10000
-        }));
+        const usersData = snapshot.docs.map(doc => {
+          const data = doc.data();
+          const plan = data.plan || 'Free';
+          let defaultLimit = 10000;
+          if (plan.toLowerCase() === 'pro') {
+            defaultLimit = 50000;
+          } else if (plan.toLowerCase() === 'business') {
+            defaultLimit = 200000;
+          } else if (plan.toLowerCase() === 'starter' || plan.toLowerCase() === 'free') {
+            defaultLimit = 10000;
+          }
+          return {
+            id: doc.id,
+            ...data,
+            plan: plan.charAt(0).toUpperCase() + plan.slice(1),
+            usedCharacters: data.usedCharacters || 0,
+            limitCharacters: data.limitCharacters || defaultLimit
+          };
+        });
         setAllUsers(usersData);
       } catch (error) {
         console.error("Error fetching users:", error);

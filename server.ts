@@ -9,10 +9,10 @@ import { getFirestore } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
 import firebaseConfig from "./firebase-applet-config.json";
 
-const app = initializeApp({
+const adminApp = initializeApp({
   projectId: firebaseConfig.projectId,
 });
-const adminDb = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const adminDb = getFirestore(adminApp, firebaseConfig.firestoreDatabaseId);
 
 const PAYPAL_SETTINGS_FILE = path.join(process.cwd(), "paypal_settings.json");
 
@@ -43,7 +43,7 @@ async function verifyAdmin(req: express.Request) {
   }
   const idToken = authHeader.split("Bearer ")[1];
   try {
-    const decodedToken = await getAuth(app).verifyIdToken(idToken);
+    const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
     if (decodedToken.email !== "abdelwadoudamirouche7@gmail.com") {
       throw new Error("Forbidden: Admin email does not match");
     }
@@ -85,6 +85,32 @@ function addWavHeader(pcmBuffer: Buffer, sampleRate: number = 24000, numChannels
   return Buffer.concat([header, pcmBuffer]);
 }
 
+async function generateContentWithRetry(ai: GoogleGenAI, params: any, maxRetries = 4, initialDelay = 1500) {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (error: any) {
+      attempt++;
+      const errorMessage = error.message || "";
+      const is503 = error.status === 503 ||
+                    errorMessage.includes("503") ||
+                    errorMessage.includes("UNAVAILABLE") ||
+                    errorMessage.includes("unavailable") ||
+                    errorMessage.includes("Service Unavailable") ||
+                    errorMessage.includes("currently unavailable");
+
+      if (is503 && attempt < maxRetries) {
+        const delay = initialDelay * Math.pow(2, attempt - 1);
+        console.warn(`[Gemini TTS Retry] Attempt ${attempt} failed with 503/UNAVAILABLE. Retrying in ${delay}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -108,6 +134,10 @@ async function startServer() {
         return res.status(404).json({ error: "Audio not found" });
       }
       res.setHeader("Content-Type", "audio/wav");
+      if (req.query.download === "true") {
+        const filename = (req.query.filename as string) || "audio.wav";
+        res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      }
       res.sendFile(filePath);
     } catch (error: any) {
       console.error("Error serving audio:", error);
@@ -115,30 +145,131 @@ async function startServer() {
     }
   });
 
+  // Key rotation helpers
+  let currentKeyIndex = 0;
+
+  function getGeminiApiKeys(): { name: string; value: string }[] {
+    const keys: { name: string; value: string; num: number }[] = [];
+    
+    for (const envKey of Object.keys(process.env)) {
+      const val = process.env[envKey];
+      if (!val || val.trim() === "" || val.includes("MY_GEMINI_API_KEY")) {
+        continue;
+      }
+      
+      const lower = envKey.toLowerCase();
+      if (lower === "gemini_api_key") {
+        keys.push({ name: envKey, value: val, num: 0 });
+      } else if (lower.startsWith("gemini_api_key")) {
+        const numMatch = envKey.match(/\d+/);
+        const num = numMatch ? parseInt(numMatch[0], 10) : 999;
+        keys.push({ name: envKey, value: val, num });
+      }
+    }
+    
+    // Sort so GEMINI_API_KEY is first (0), then gemini_api_key1, gemini_api_key2, etc.
+    keys.sort((a, b) => a.num - b.num);
+    
+    // Return unique keys based on their secret values
+    const uniqueKeys: { name: string; value: string }[] = [];
+    const seenValues = new Set<string>();
+    for (const k of keys) {
+      if (!seenValues.has(k.value)) {
+        seenValues.add(k.value);
+        uniqueKeys.push({ name: k.name, value: k.value });
+      }
+    }
+    
+    return uniqueKeys;
+  }
+
   // API Routes
   app.post("/api/tts", async (req, res) => {
     try {
       const { text, dialect, style, voice, speed, pitch, emotion } = req.body;
       
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const apiKeys = getGeminiApiKeys();
+      if (apiKeys.length === 0) {
+        return res.status(500).json({ error: "Gemini API key is not configured in environment/secrets. Please add GEMINI_API_KEY or gemini_api_key1 in Secrets." });
+      }
       
       const prompt = `Please speak the following Arabic text. DO NOT read it as Modern Standard Arabic (Fusha). You MUST adopt a strong, authentic, and natural native ${dialect} accent. Use the precise intonation, rhythm, and pronunciation characteristic of native speakers from that region. Speak in a ${style} and ${emotion} tone. Ensure the dialect's unique phonetic traits are highly prominent.
 تحدث بلهجة ${dialect} أصلية وواضحة جداً، مع نبرة ${emotion} وبأسلوب ${style}. إقرأ النص بطريقة تبدو وكأنها لشخص حقيقي من تلك المنطقة، وليس باللغة العربية الفصحى.
 
 Text: ${text}`;
       
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-tts-preview",
-        contents: [{ parts: [{ text: prompt }] }],
-        config: {
-          responseModalities: ["audio" as any],
-          speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: voice },
+      let response = null;
+      let lastError: any = null;
+      let startIdx = currentKeyIndex;
+      
+      // Safety reset if keys array shrunk
+      if (startIdx >= apiKeys.length) {
+        startIdx = 0;
+        currentKeyIndex = 0;
+      }
+      
+      for (let i = 0; i < apiKeys.length; i++) {
+        const tryIdx = (startIdx + i) % apiKeys.length;
+        const keyObj = apiKeys[tryIdx];
+        
+        console.log(`[Gemini TTS] Attempting generation with key: ${keyObj.name} (index ${tryIdx}/${apiKeys.length - 1})`);
+        
+        const ai = new GoogleGenAI({ apiKey: keyObj.value });
+        
+        try {
+          response = await generateContentWithRetry(ai, {
+            model: "gemini-3.1-flash-tts-preview",
+            contents: [{ parts: [{ text: prompt }] }],
+            config: {
+              responseModalities: ["audio" as any],
+              speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: voice },
+                  },
               },
-          },
-        },
-      });
+            },
+          });
+          
+          // Save successful key index
+          currentKeyIndex = tryIdx;
+          console.log(`[Gemini TTS] Successfully generated audio using key: ${keyObj.name}`);
+          break;
+        } catch (err: any) {
+          lastError = err;
+          const msg = (err.message || "").toLowerCase();
+          const isKeySpecific = (
+            msg.includes("quota") ||
+            msg.includes("limit") ||
+            msg.includes("exhausted") ||
+            msg.includes("429") ||
+            msg.includes("api key") ||
+            msg.includes("apikey") ||
+            msg.includes("key not") ||
+            msg.includes("invalid") ||
+            msg.includes("unauthorized") ||
+            msg.includes("forbidden") ||
+            err.status === 429 ||
+            err.status === 401 ||
+            err.status === 403
+          );
+          
+          if (isKeySpecific) {
+            console.warn(`[Gemini TTS] Key ${keyObj.name} failed with quota/key error: ${err.message}. Trying next key...`);
+            continue;
+          } else {
+            // Re-throw if it's a structural or request-level validation error
+            throw err;
+          }
+        }
+      }
+      
+      if (!response) {
+        if (lastError) {
+          throw lastError;
+        } else {
+          throw new Error("Failed to generate voiceovers with any of the configured Gemini API keys.");
+        }
+      }
       
       const audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
       
@@ -156,8 +287,9 @@ Text: ${text}`;
     } catch (error: any) {
       console.error("Error in /api/tts:", error);
       let message = error.message || "An unexpected error occurred.";
-      if (typeof message === 'string' && (message.toLowerCase().includes("quota") || message.toLowerCase().includes("limit") || message.toLowerCase().includes("exhausted") || message.toLowerCase().includes("429"))) {
-        message = "You have exceeded the daily Free Tier limit of 10 speech generations for this model. To generate more voices, please configure your own Paid API Key in Settings > Secrets or try again tomorrow.";
+      const lowerMsg = message.toLowerCase();
+      if (typeof message === 'string' && (lowerMsg.includes("quota") || lowerMsg.includes("limit") || lowerMsg.includes("exhausted") || lowerMsg.includes("429"))) {
+        message = "⚠️ خطأ في التوليد\n\nYou have exceeded the daily Free Tier limit of 10 speech generations for this model. To generate more voices, please configure your own Paid API Key in Settings > Secrets or try again tomorrow.";
       }
       res.status(500).json({ error: message });
     }
@@ -343,6 +475,17 @@ Text: ${text}`;
 
   app.post("/api/orders", async (req, res) => {
     try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Missing or invalid Authorization header" });
+      }
+      const idToken = authHeader.split("Bearer ")[1];
+      try {
+        await getAuth(adminApp).verifyIdToken(idToken);
+      } catch (err: any) {
+        return res.status(401).json({ error: `Authentication failed: ${err.message}` });
+      }
+
       const { plan } = req.body;
       const { baseUrl } = await getPayPalCredentials();
       let price = "0.00";
@@ -422,7 +565,7 @@ Text: ${text}`;
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*all', (req, res) => {
+    app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

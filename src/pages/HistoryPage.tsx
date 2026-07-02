@@ -5,6 +5,7 @@ import { db } from '../lib/firebase';
 import { collection, query, orderBy, getDocs, deleteDoc, doc, Bytes } from 'firebase/firestore';
 import { Play, Pause, Download, Trash2, Clock, Loader2 } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { getDialectFlag } from '../lib/utils';
 
 interface HistoryItem {
   id: string;
@@ -25,6 +26,7 @@ export default function HistoryPage() {
   const [loadedAudios, setLoadedAudios] = useState<Record<string, string>>({});
   const [loadingAudioId, setLoadingAudioId] = useState<string | null>(null);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const currentPlayRequestRef = useRef<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -128,16 +130,25 @@ export default function HistoryPage() {
 
   const handleDownload = async (url: string, filename: string) => {
     try {
-      const response = await fetch(url);
-      const blob = await response.blob();
-      const blobUrl = URL.createObjectURL(blob);
+      let downloadUrl = url;
+      
+      if (!url.startsWith('blob:')) {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        const blob = await response.blob();
+        downloadUrl = URL.createObjectURL(blob);
+      }
+
       const link = document.createElement('a');
-      link.href = blobUrl;
+      link.href = downloadUrl;
       link.download = filename;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      URL.revokeObjectURL(blobUrl);
+
+      if (!url.startsWith('blob:')) {
+        setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
+      }
     } catch (error) {
       console.error('Error downloading file:', error);
       alert(t('download_failed'));
@@ -145,15 +156,21 @@ export default function HistoryPage() {
   };
 
   const playAudio = async (id: string, url: string) => {
+    // Immediately pause any active audio
     if (activeAudioRef.current) {
       activeAudioRef.current.pause();
-      if (playingId === id) {
-        setPlayingId(null);
-        activeAudioRef.current = null;
-        return;
-      }
+      activeAudioRef.current = null;
     }
 
+    // If the user clicked to pause the currently playing audio, we are done
+    if (playingId === id) {
+      setPlayingId(null);
+      currentPlayRequestRef.current = null;
+      return;
+    }
+
+    // Record the active play request
+    currentPlayRequestRef.current = id;
     let audioUrlToPlay = loadedAudios[id] || url;
 
     // Verify if the url is accessible, or fall back to reconstructing from Firestore chunks
@@ -170,24 +187,57 @@ export default function HistoryPage() {
         if (reconstructedUrl) {
           audioUrlToPlay = reconstructedUrl;
           setLoadedAudios(prev => ({ ...prev, [id]: reconstructedUrl }));
+        } else {
+          console.error("Failed to rebuild audio from chunks.");
+          setLoadingAudioId(null);
+          currentPlayRequestRef.current = null;
+          alert(t('download_failed') || "Failed to load audio");
+          return;
         }
       } finally {
         setLoadingAudioId(null);
       }
     }
 
-    const audio = new Audio(audioUrlToPlay);
-    activeAudioRef.current = audio;
-    setPlayingId(id);
-    
-    audio.play().catch(err => {
-      console.error("Error playing:", err);
-    });
-    
-    audio.onended = () => {
-      setPlayingId(null);
-      activeAudioRef.current = null;
-    };
+    // Check if this request is still the latest one
+    if (currentPlayRequestRef.current !== id) {
+      return;
+    }
+
+    try {
+      const audio = new Audio(audioUrlToPlay);
+      activeAudioRef.current = audio;
+      setPlayingId(id);
+      
+      audio.onended = () => {
+        if (currentPlayRequestRef.current === id) {
+          setPlayingId(null);
+          activeAudioRef.current = null;
+          currentPlayRequestRef.current = null;
+        }
+      };
+
+      audio.onerror = (e) => {
+        console.error("Audio playback error event:", e);
+        if (currentPlayRequestRef.current === id) {
+          setPlayingId(null);
+          activeAudioRef.current = null;
+          currentPlayRequestRef.current = null;
+        }
+      };
+
+      await audio.play();
+    } catch (err: any) {
+      // Ignore AbortError since it's expected when user pauses or switches tracks
+      if (err.name !== 'AbortError') {
+        console.error("Error playing:", err);
+      }
+      if (currentPlayRequestRef.current === id) {
+        setPlayingId(null);
+        activeAudioRef.current = null;
+        currentPlayRequestRef.current = null;
+      }
+    }
   };
 
   if (!user) {
@@ -225,7 +275,10 @@ export default function HistoryPage() {
               <div className="flex-1 min-w-0 w-full">
                 <p className="text-lg font-arabic text-white mb-3 truncate font-light" dir="rtl">{item.text}</p>
                 <div className="flex flex-wrap gap-2 text-[9px] uppercase tracking-widest font-bold text-white/60">
-                  <span className="rounded border border-white/10 bg-white/5 px-2 py-1">{t(item.dialect)}</span>
+                  <span className="rounded border border-white/10 bg-white/5 px-2 py-1 flex items-center gap-1.5">
+                    <span>{getDialectFlag(item.dialect)}</span>
+                    <span>{t(item.dialect)}</span>
+                  </span>
                   <span className="rounded border border-white/10 bg-white/5 px-2 py-1">{t(item.style)}</span>
                   <span className="rounded border border-brand-500/30 bg-brand-500/10 text-brand-500 px-2 py-1">{t(item.voice)}</span>
                 </div>
@@ -245,23 +298,24 @@ export default function HistoryPage() {
                     <Play size={16} className="ml-0.5" />
                   )}
                 </button>
-                <button 
-                  onClick={() => {
-                    if (userData?.plan === 'Free') {
-                      alert(t('upgrade_download'));
-                      return;
-                    }
-                    handleDownload(loadedAudios[item.id] || item.audioUrl, "doudouvoice-generation.wav");
-                  }}
-                  className={`flex h-10 w-10 items-center justify-center rounded-full border transition-colors ${
-                    userData?.plan === 'Free'
-                      ? 'border-white/10 text-white/20 hover:bg-transparent cursor-not-allowed'
-                      : 'border-white/20 bg-white/5 text-white hover:bg-white/10'
-                  }`}
-                  title={userData?.plan === 'Free' ? t('upgrade_download') : t('download_audio')}
-                >
-                  <Download size={16} />
-                </button>
+                {userData?.plan === 'Free' ? (
+                  <button 
+                    onClick={() => alert(t('upgrade_download'))}
+                    className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 text-white/20 cursor-not-allowed"
+                    title={t('upgrade_download')}
+                  >
+                    <Download size={16} />
+                  </button>
+                ) : (
+                  <button 
+                    onClick={() => handleDownload(loadedAudios[item.id] || item.audioUrl, "doudouvoice-generation.wav")}
+                    className="flex h-10 px-2 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white hover:bg-white/10 gap-0.5"
+                    title="Download WAV"
+                  >
+                    <Download size={12} />
+                    <span className="text-[8px] font-bold">WAV</span>
+                  </button>
+                )}
                 <button 
                   onClick={() => handleDelete(item.id)}
                   className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-white/5 text-red-500 transition-colors hover:bg-red-500/10 hover:border-red-500/50"

@@ -5,6 +5,7 @@ import { useAuth } from '../lib/AuthContext';
 import { useLanguage } from '../lib/LanguageContext';
 import { db } from '../lib/firebase';
 import { collection, addDoc, serverTimestamp, doc, setDoc, Bytes } from 'firebase/firestore';
+import { getDialectFlag } from '../lib/utils';
 
 const DIALECTS = [
   'Saudi Arabic',
@@ -63,6 +64,18 @@ export default function GeneratorPage() {
       return;
     }
 
+    const currentUsed = userData?.usedCharacters || 0;
+    const limit = userData?.limitCharacters || (userData?.plan === 'Pro' ? 50000 : userData?.plan === 'Business' ? 200000 : 10000);
+    if (userData?.plan !== 'Free' && (currentUsed + text.length) > limit) {
+      const isAr = document.documentElement.dir === 'rtl';
+      setError(
+        isAr 
+          ? `لقد تجاوزت الحد الأقصى للحروف المسموح به لخطة ${t(userData?.plan || 'Starter')} (${limit.toLocaleString()} حرف). يرجى ترقية خطتك لمواصلة التوليد.`
+          : `You have exceeded the character limit for your ${userData?.plan || 'Starter'} plan (${limit.toLocaleString()} chars). Please upgrade to continue.`
+      );
+      return;
+    }
+
     setIsGenerating(true);
     setAudioUrl(null);
     setIsPlaying(false);
@@ -85,11 +98,10 @@ export default function GeneratorPage() {
       setAudioUrl(data.audio);
       
       if (user) {
-        if (userData?.plan === 'Free') {
-           await setDoc(doc(db, 'users', user.uid), {
-             generationCount: (userData.generationCount || 0) + 1
-           }, { merge: true });
-        }
+        await setDoc(doc(db, 'users', user.uid), {
+          generationCount: (userData?.generationCount || 0) + 1,
+          usedCharacters: (userData?.usedCharacters || 0) + text.length
+        }, { merge: true });
 
         const historyDocRef = await addDoc(collection(db, 'users', user.uid, 'history'), {
           userId: user.uid,
@@ -134,27 +146,43 @@ export default function GeneratorPage() {
     }
   };
 
-  const handlePlayPause = () => {
+  const handlePlayPause = async () => {
     if (!audioRef.current) return;
-    if (isPlaying) {
-      audioRef.current.pause();
-    } else {
-      audioRef.current.play().catch(err => console.error("Error playing audio:", err));
+    try {
+      if (isPlaying) {
+        audioRef.current.pause();
+      } else {
+        await audioRef.current.play();
+      }
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        console.error("Error playing audio:", err);
+      }
+      setIsPlaying(false);
     }
   };
 
   const handleDownload = async (url: string, filename: string) => {
     try {
-      const response = await fetch(url);
-      const blob = await response.blob();
-      const blobUrl = URL.createObjectURL(blob);
+      let downloadUrl = url;
+      
+      if (!url.startsWith('blob:')) {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        const blob = await response.blob();
+        downloadUrl = URL.createObjectURL(blob);
+      }
+
       const link = document.createElement('a');
-      link.href = blobUrl;
+      link.href = downloadUrl;
       link.download = filename;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      URL.revokeObjectURL(blobUrl);
+
+      if (!url.startsWith('blob:')) {
+        setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
+      }
     } catch (error) {
       console.error('Error downloading file:', error);
       alert(t('download_failed'));
@@ -175,7 +203,10 @@ export default function GeneratorPage() {
                 onClick={() => setDialect(d)}
                 className={`flex items-center justify-between p-2.5 rounded text-sm transition-all ${dialect === d ? 'bg-white/5 border border-brand-500/30 text-white' : 'hover:bg-white/5 text-white/60'}`}
               >
-                <span className="flex items-center gap-2">{t(d)}</span>
+                <span className="flex items-center gap-2">
+                  <span className="text-base shrink-0">{getDialectFlag(d)}</span>
+                  <span>{t(d)}</span>
+                </span>
                 {dialect === d && <span className="text-[10px] text-brand-500 font-bold uppercase tracking-widest">{t('active')}</span>}
               </button>
             ))}
@@ -231,6 +262,10 @@ export default function GeneratorPage() {
                   onPlay={() => setIsPlaying(true)}
                   onPause={() => setIsPlaying(false)}
                   onEnded={() => setIsPlaying(false)}
+                  onError={(e) => {
+                    console.error("Audio error event:", e);
+                    setIsPlaying(false);
+                  }}
                   className="hidden" 
                 />
                 <button 
@@ -264,23 +299,28 @@ export default function GeneratorPage() {
             </button>
 
             {audioUrl && (
-              <button
-                onClick={() => {
-                  if (userData?.plan === 'Free') {
+              userData?.plan === 'Free' ? (
+                <button
+                  onClick={() => {
                     alert(t('upgrade_download'));
-                    return;
-                  }
-                  handleDownload(audioUrl, "doudouvoice-generation.wav");
-                }}
-                className={`w-12 h-12 rounded-full border flex items-center justify-center transition-colors ${
-                  userData?.plan === 'Free' 
-                    ? 'border-white/10 text-white/20 hover:bg-transparent cursor-not-allowed' 
-                    : 'border-white/20 hover:bg-white/5 text-white'
-                }`}
-                title={userData?.plan === 'Free' ? t('upgrade_download') : t('download_audio')}
-              >
-                <Download size={20} />
-              </button>
+                  }}
+                  className="w-12 h-12 rounded-full border border-white/10 text-white/20 hover:bg-transparent cursor-not-allowed flex items-center justify-center transition-colors"
+                  title={t('upgrade_download')}
+                >
+                  <Download size={20} />
+                </button>
+              ) : (
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => handleDownload(audioUrl, "doudouvoice-generation.wav")}
+                    className="px-4.5 h-12 rounded-full border border-white/20 hover:bg-white/5 text-white flex items-center justify-center gap-1.5 transition-colors"
+                    title="Download WAV"
+                  >
+                    <Download size={16} />
+                    <span className="text-[10px] font-bold tracking-wider">WAV</span>
+                  </button>
+                </div>
+              )
             )}
           </div>
         </div>
@@ -296,7 +336,7 @@ export default function GeneratorPage() {
             onChange={(e) => setDialect(e.target.value)}
             className="w-full rounded bg-white/5 border border-white/10 px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none"
           >
-            {DIALECTS.map(d => <option key={d} value={d} className="bg-black">{t(d)}</option>)}
+            {DIALECTS.map(d => <option key={d} value={d} className="bg-black">{getDialectFlag(d)} {t(d)}</option>)}
           </select>
         </div>
 

@@ -15,7 +15,7 @@ const TIERS = [
     features: [
       'char_10k',
       'std_voices',
-      'mp3_dl',
+      'wav_dl',
       'personal_lic'
     ],
     buttonText: 'get_started',
@@ -28,7 +28,7 @@ const TIERS = [
     features: [
       'char_50k',
       'all_premium',
-      'wav_mp3',
+      'wav_dl',
       'commercial_lic',
       'priority_gen'
     ],
@@ -95,9 +95,17 @@ export default function PricingPage() {
   const handlePaymentSuccess = async (plan: string) => {
     if (!user) return;
     try {
+      let limitCharacters = 10000;
+      const lowerPlan = plan.toLowerCase();
+      if (lowerPlan === 'pro') limitCharacters = 50000;
+      else if (lowerPlan === 'business') limitCharacters = 200000;
+      else if (lowerPlan === 'starter') limitCharacters = 10000;
+
       await updateDoc(doc(db, 'users', user.uid), {
         plan: plan.charAt(0).toUpperCase() + plan.slice(1),
-        generationCount: 0 // Reset generation count on upgrade
+        generationCount: 0, // Reset generation count on upgrade
+        limitCharacters: limitCharacters,
+        usedCharacters: 0 // Reset characters so they start fresh on their new billing cycle
       });
       alert(t('payment_success'));
       setSelectedPlan(null);
@@ -111,9 +119,13 @@ export default function PricingPage() {
   const createOrder = async (data: any, actions: any) => {
     try {
       setPaymentError(null);
+      const token = user ? await user.getIdToken() : "";
       const response = await fetch("/api/orders", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({ plan: selectedPlan }),
       });
       const orderData = await response.json();

@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { signInWithGoogle, auth } from '../lib/firebase';
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
 import { useNavigate } from 'react-router-dom';
-import { Mic, Mail, Lock, ArrowRight } from 'lucide-react';
+import { Mail, Lock, ArrowRight } from 'lucide-react';
 import { useAuth } from '../lib/AuthContext';
 import { useLanguage } from '../lib/LanguageContext';
 
@@ -62,9 +62,12 @@ export default function AuthPage() {
         className="w-full max-w-md bg-white/5 border border-white/10 p-8 rounded-2xl flex flex-col gap-8 relative z-10 backdrop-blur-sm"
       >
         <div className="flex flex-col items-center gap-4 text-center">
-          <div className="w-12 h-12 bg-brand-500 rounded-xl flex items-center justify-center">
-            <Mic size={24} className="text-black" />
-          </div>
+          <img 
+            src="/logo.png" 
+            alt="DoudouVoice" 
+            className="w-12 h-12 rounded-xl object-contain" 
+            referrerPolicy="no-referrer" 
+          />
           <div className="flex flex-col gap-1">
             <h1 className="text-2xl font-bold tracking-tight text-white">
               {isLogin ? t('welcome_back') : t('create_account')}
