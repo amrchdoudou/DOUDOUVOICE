@@ -160,8 +160,12 @@ async function startServer() {
         continue;
       }
       
+      if (envKey === "gemini_api_key") {
+        continue; // User requested to ignore the exact lowercase 'gemini_api_key'
+      }
+
       const lower = envKey.toLowerCase();
-      if (lower === "gemini_api_key") {
+      if (envKey === "GEMINI_API_KEY") {
         keys.push({ name: envKey, value: val, num: 0 });
       } else if (lower.startsWith("gemini_api_key")) {
         const numMatch = envKey.match(/\d+/);
@@ -414,6 +418,8 @@ Text: ${text}`;
           
           if (isKeySpecific) {
             console.warn(`[Gemini TTS] Key ${keyObj.name} failed with quota/key error: ${err.message}. Trying next key...`);
+            // Point to the next key globally so subsequent requests can try it immediately if we crash here
+            currentKeyIndex = (tryIdx + 1) % apiKeys.length;
             continue;
           } else {
             // Re-throw if it's a request-level validation error
@@ -423,6 +429,8 @@ Text: ${text}`;
       }
       
       if (!response) {
+        // All keys failed. Reset to start from GEMINI_API_KEY for future requests.
+        currentKeyIndex = 0;
         if (lastError) {
           throw lastError;
         } else {
