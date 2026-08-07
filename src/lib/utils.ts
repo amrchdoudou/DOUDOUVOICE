@@ -31,6 +31,8 @@ export function getDialectFlag(dialect: string): string {
       return '🇲🇦';
     case 'Syrian Arabic':
       return '🇸🇾';
+    case 'Iraqi Arabic':
+      return '🇮🇶';
     case 'Palestinian Arabic':
       return '🇵🇸';
     case 'Neutral Middle Eastern Arabic':

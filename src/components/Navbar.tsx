@@ -8,7 +8,7 @@ import { LogOut, User, Globe, Menu, X, Mic, CreditCard, History, LayoutDashboard
 import { motion, AnimatePresence } from 'motion/react';
 
 export default function Navbar() {
-  const { user } = useAuth();
+  const { user, userData } = useAuth();
   const { language, setLanguage, t } = useLanguage();
   const { theme, toggleTheme } = useTheme();
   const [isMenuOpen, setIsMenuOpen] = useState(false);
@@ -36,6 +36,10 @@ export default function Navbar() {
     ...(user ? [{ label: t('history'), path: '/history', icon: History }] : []),
     ...(user?.email === 'abdelwadoudamirouche7@gmail.com' ? [{ label: t('dashboard'), path: '/dashboard', icon: LayoutDashboard }] : []),
   ];
+
+  const limitCharacters = userData ? (userData.limitCharacters || (userData.plan?.toLowerCase() === 'pro' ? 50000 : userData.plan?.toLowerCase() === 'business' ? 200000 : 10000)) : 0;
+  const usedCharacters = userData?.usedCharacters || 0;
+  const remainingCharacters = Math.max(0, limitCharacters - usedCharacters);
 
   return (
     <nav className="h-16 border-b border-white/10 flex items-center justify-between px-6 bg-[#0a0a0a] shrink-0 relative z-50" dir="ltr">
@@ -103,6 +107,14 @@ export default function Navbar() {
 
         {user ? (
           <div className="flex items-center gap-4">
+            {userData && (
+              <div className="hidden lg:flex flex-col items-end border-r border-white/10 pr-4 mr-2">
+                <span className="text-[10px] uppercase tracking-widest text-white/40 font-bold">{t('characters') || 'Characters'}</span>
+                <span className="text-xs font-mono text-white/80" title="Used / Remaining">
+                  {usedCharacters.toLocaleString()} / <span className="text-brand-400">{remainingCharacters.toLocaleString()}</span>
+                </span>
+              </div>
+            )}
             <Link to="/profile" className="flex items-center gap-2 hover:opacity-80 transition-opacity">
               {user.photoURL ? (
                 <img 
@@ -136,6 +148,13 @@ export default function Navbar() {
 
       {/* Mobile Controls & Trigger */}
       <div className="flex items-center gap-3 md:hidden">
+        {user && userData && (
+          <div className="flex flex-col items-end mr-1">
+             <span className="text-[9px] font-mono text-white/70" title="Used / Remaining">
+                {usedCharacters.toLocaleString()} / <span className="text-brand-400">{remainingCharacters.toLocaleString()}</span>
+             </span>
+          </div>
+        )}
         {/* Short Profile preview / auth link directly on Navbar for quick access */}
         {user ? (
           <Link to="/profile" onClick={() => setIsMenuOpen(false)} className="flex items-center hover:opacity-80 transition-opacity">

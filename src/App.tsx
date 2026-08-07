@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './lib/AuthContext';
 import { LanguageProvider } from './lib/LanguageContext';
@@ -19,6 +20,7 @@ import DashboardPage from './pages/DashboardPage';
 import TermsPage from './pages/TermsPage';
 import PrivacyPage from './pages/PrivacyPage';
 import RefundPage from './pages/RefundPage';
+import { initMetaPixel } from './lib/MetaPixel';
 
 const paypalOptions = {
   clientId: (import.meta as any).env.VITE_PAYPAL_CLIENT_ID && (import.meta as any).env.VITE_PAYPAL_CLIENT_ID !== "YOUR_PAYPAL_CLIENT_ID" 
@@ -30,6 +32,10 @@ const paypalOptions = {
 };
 
 export default function App() {
+  useEffect(() => {
+    initMetaPixel();
+  }, []);
+
   return (
     <ThemeProvider>
       <AuthProvider>

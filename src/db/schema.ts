@@ -3,6 +3,9 @@ import { pgTable, text, integer, timestamp, serial } from 'drizzle-orm/pg-core';
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
   uid: text('uid').notNull().unique(), // Firebase Auth UID
+  email: text('email'),
+  displayName: text('display_name'),
+  photoURL: text('photo_url'),
   plan: text('plan').notNull().default('Free'),
   generationCount: integer('generation_count').notNull().default(0),
   limitCharacters: integer('limit_characters').notNull().default(5000),
@@ -29,4 +32,10 @@ export const history = pgTable('history', {
   voice: text('voice').notNull(),
   audioUrl: text('audio_url').notNull(),
   createdAt: timestamp('created_at').defaultNow(),
+});
+
+export const settings = pgTable('settings', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: timestamp('updated_at').defaultNow(),
 });

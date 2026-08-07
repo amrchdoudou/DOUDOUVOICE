@@ -4,6 +4,7 @@ import { Play, Pause, Download, Loader2, Settings2, History } from 'lucide-react
 import { useAuth } from '../lib/AuthContext';
 import { useLanguage } from '../lib/LanguageContext';
 import { getDialectFlag } from '../lib/utils';
+import { trackMetaCustomEvent } from '../lib/MetaPixel';
 
 const DIALECTS = [
   'Saudi Arabic',
@@ -18,6 +19,7 @@ const DIALECTS = [
   'Libyan Arabic',
   'Moroccan Arabic',
   'Syrian Arabic',
+  'Iraqi Arabic',
   'Palestinian Arabic',
   'Neutral Middle Eastern Arabic'
 ];
@@ -98,6 +100,16 @@ export default function GeneratorPage() {
       if (!res.ok) throw new Error(data.error || 'Failed to generate');
       
       setAudioUrl(data.audio);
+
+      trackMetaCustomEvent('GenerateVoice', {
+        voice,
+        dialect,
+        style,
+        emotion,
+        speed,
+        textLength: text.length,
+        email: user?.email
+      });
       
       if (user) {
         try {

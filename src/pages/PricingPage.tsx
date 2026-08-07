@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { useLanguage } from '../lib/LanguageContext';
 import { useAuth } from '../lib/AuthContext';
 import { PayPalButtons, usePayPalScriptReducer } from '@paypal/react-paypal-js';
+import { trackMetaEvent } from '../lib/MetaPixel';
 
 const TIERS = [
   {
@@ -140,6 +141,15 @@ export default function PricingPage() {
         throw new Error(orderData.error);
       } else {
         // Capture successful
+        const numericPrice = selectedPlan === 'pro' ? 19 : selectedPlan === 'business' ? 49 : selectedPlan === 'starter' ? 7 : 0;
+        trackMetaEvent('Purchase', {
+          value: numericPrice,
+          currency: 'USD',
+          content_name: selectedPlan,
+          content_category: 'Plan Subscription',
+          email: user?.email
+        });
+
         alert(t('payment_success'));
         setSelectedPlan(null);
         setPaymentError(null);

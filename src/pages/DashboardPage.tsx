@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { useAuth } from '../lib/AuthContext';
-import { Users } from 'lucide-react';
+import { Users, Edit2, Trash2, Check, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 const ADMIN_EMAIL = 'abdelwadoudamirouche7@gmail.com';
@@ -19,6 +19,62 @@ export default function DashboardPage() {
   const [testResult, setTestResult] = useState<{success?: boolean, message?: string} | null>(null);
   const [isTesting, setIsTesting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+
+  // Meta Pixel State
+  const [metaPixelId, setMetaPixelId] = useState('');
+  const [metaResult, setMetaResult] = useState<{success?: boolean, message?: string} | null>(null);
+  const [isMetaTesting, setIsMetaTesting] = useState(false);
+  const [isMetaSaving, setIsMetaSaving] = useState(false);
+
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState({ plan: '', usedCharacters: 0, limitCharacters: 0 });
+
+  const handleDeleteUser = async (uid: string) => {
+    if (!window.confirm("Are you sure you want to delete this user completely? This cannot be undone.")) return;
+    try {
+      const idToken = await user!.getIdToken();
+      const res = await fetch(`/api/admin/users/${uid}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${idToken}` }
+      });
+      if (res.ok) {
+        setAllUsers(allUsers.filter(u => u.uid !== uid));
+      } else {
+        const data = await res.json();
+        alert(data.error || "Failed to delete");
+      }
+    } catch (e: any) {
+      alert(e.message);
+    }
+  };
+
+  const handleEditClick = (u: any) => {
+    setEditingUserId(u.uid);
+    setEditForm({ plan: u.plan, usedCharacters: u.usedCharacters, limitCharacters: u.limitCharacters });
+  };
+
+  const handleSaveEdit = async (uid: string) => {
+    try {
+      const idToken = await user!.getIdToken();
+      const res = await fetch(`/api/admin/users/${uid}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${idToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(editForm)
+      });
+      if (res.ok) {
+        setAllUsers(allUsers.map(u => u.uid === uid ? { ...u, ...editForm } : u));
+        setEditingUserId(null);
+      } else {
+        const data = await res.json();
+        alert(data.error || "Failed to update");
+      }
+    } catch (e: any) {
+      alert(e.message);
+    }
+  };
 
   const handleSaveOnly = async (e: React.MouseEvent) => {
     e.preventDefault();
@@ -77,6 +133,61 @@ export default function DashboardPage() {
     }
   };
 
+  const handleSaveMetaOnly = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (!metaPixelId) return;
+    setIsMetaSaving(true);
+    setMetaResult(null);
+    try {
+      const idToken = await user?.getIdToken();
+      const response = await fetch('/api/meta/save', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ pixelId: metaPixelId })
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setMetaResult({ success: true, message: 'Meta Pixel credentials saved successfully!' });
+      } else {
+        setMetaResult({ success: false, message: `Failed to save on server: ${data.error || 'Error occurred.'}` });
+      }
+    } catch (error: any) {
+      setMetaResult({ success: false, message: `Failed to save: ${error.message || 'Error occurred.'}` });
+    } finally {
+      setIsMetaSaving(false);
+    }
+  };
+
+  const handleTestMeta = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsMetaTesting(true);
+    setMetaResult(null);
+    try {
+      const idToken = await user?.getIdToken();
+      const response = await fetch('/api/meta/test', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ pixelId: metaPixelId })
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setMetaResult({ success: true, message: data.message || 'Meta settings saved & connection tested successfully!' });
+      } else {
+        setMetaResult({ success: false, message: `Connection failed: ${data.error || 'Authentication failed.'}` });
+      }
+    } catch (error: any) {
+      setMetaResult({ success: false, message: `Connection test errored: ${error.message || 'An error occurred.'}` });
+    } finally {
+      setIsMetaTesting(false);
+    }
+  };
+
   useEffect(() => {
     if (!user || user.email !== ADMIN_EMAIL) {
       navigate('/');
@@ -94,6 +205,18 @@ export default function DashboardPage() {
         }
       } catch (error) {
         console.error("Error loading PayPal settings:", error);
+      }
+    };
+
+    const fetchMetaSettings = async () => {
+      try {
+        const response = await fetch('/api/meta/config');
+        if (response.ok) {
+          const data = await response.json();
+          if (data.pixelId) setMetaPixelId(data.pixelId);
+        }
+      } catch (error) {
+        console.error("Error loading Meta Pixel settings:", error);
       }
     };
 
@@ -117,6 +240,7 @@ export default function DashboardPage() {
     };
 
     fetchPayPalSettings();
+    fetchMetaSettings();
     fetchUsers();
   }, [user, navigate]);
 
@@ -205,6 +329,54 @@ export default function DashboardPage() {
             </form>
           </div>
 
+          {/* Meta Pixel & Conversions API Integration */}
+          <div className="bg-white/5 border border-white/10 rounded-xl p-6 mb-8">
+            <h2 className="text-xl font-medium text-white tracking-wide mb-4">Configure Meta Pixel</h2>
+            <p className="text-white/60 mb-6 text-sm">Enter your Meta Pixel ID to enable browser tracking.</p>
+            
+            <form onSubmit={handleTestMeta} className="flex flex-col gap-4 max-w-2xl">
+              <div className="flex gap-4">
+                <div className="flex-1 flex flex-col gap-1.5">
+                  <label className="text-xs uppercase tracking-widest text-white/50 font-bold">Meta Pixel ID</label>
+                  <input
+                    type="text"
+                    value={metaPixelId}
+                    onChange={(e) => setMetaPixelId(e.target.value)}
+                    className="w-full bg-[#0a0a0a] border border-white/10 rounded px-4 py-2 text-white focus:outline-none focus:border-brand-500"
+                    placeholder="Enter Meta Pixel ID (e.g. 1234567890)"
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-4 mt-2">
+                <button
+                  type="button"
+                  onClick={handleSaveMetaOnly}
+                  disabled={isMetaSaving || isMetaTesting || !metaPixelId}
+                  className="bg-white/10 text-white border border-white/20 px-6 py-2 rounded font-bold uppercase tracking-widest text-xs hover:bg-white/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {isMetaSaving ? 'Saving...' : 'Save Credentials'}
+                </button>
+
+                <button
+                  type="submit"
+                  disabled={isMetaSaving || isMetaTesting || !metaPixelId}
+                  className="bg-brand-500 text-black px-6 py-2 rounded font-bold uppercase tracking-widest text-xs hover:bg-brand-400 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {isMetaTesting ? 'Saving & Testing...' : 'Save & Test Connection'}
+                </button>
+                
+                {metaResult && (
+                  <div className={`text-sm ${metaResult.success ? 'text-green-400' : 'text-red-400'} flex-1 min-w-[200px]`}>
+                    {metaResult.success ? '✓ ' : '✗ '}
+                    {metaResult.message}
+                  </div>
+                )}
+              </div>
+            </form>
+          </div>
+
           {/* All Users Table */}
           <div className="flex items-center justify-between">
             <h2 className="text-xl font-medium text-white tracking-wide">All Users & Usage</h2>
@@ -220,16 +392,17 @@ export default function DashboardPage() {
                     <th className="p-4 text-xs font-bold uppercase tracking-widest text-white/50">Usage (Chars)</th>
                     <th className="p-4 text-xs font-bold uppercase tracking-widest text-white/50">Remaining</th>
                     <th className="p-4 text-xs font-bold uppercase tracking-widest text-white/50 text-right">Joined</th>
+                    <th className="p-4 text-xs font-bold uppercase tracking-widest text-white/50 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {loadingUsers ? (
                     <tr>
-                      <td colSpan={5} className="p-8 text-center text-white/40 text-sm">Loading users...</td>
+                      <td colSpan={6} className="p-8 text-center text-white/40 text-sm">Loading users...</td>
                     </tr>
                   ) : allUsers.length === 0 ? (
                     <tr>
-                      <td colSpan={5} className="p-8 text-center text-white/40 text-sm">No users found.</td>
+                      <td colSpan={6} className="p-8 text-center text-white/40 text-sm">No users found.</td>
                     </tr>
                   ) : (
                     allUsers.map((u) => (
@@ -246,30 +419,109 @@ export default function DashboardPage() {
                           </div>
                         </td>
                         <td className="p-4">
-                          <span className={`inline-flex items-center px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${
-                            u.plan === 'Pro' ? 'bg-purple-500/10 text-purple-400' :
-                            u.plan === 'Business' ? 'bg-blue-500/10 text-blue-400' :
-                            'bg-green-500/10 text-green-400'
-                          }`}>
-                            {u.plan}
-                          </span>
+                          {editingUserId === u.uid ? (
+                            <select
+                              value={editForm.plan}
+                              onChange={(e) => setEditForm({ ...editForm, plan: e.target.value })}
+                              className="bg-[#0a0a0a] border border-white/10 rounded px-2 py-1 text-white text-xs w-24"
+                            >
+                              <option value="Free">Free</option>
+                              <option value="Starter">Starter</option>
+                              <option value="Pro">Pro</option>
+                              <option value="Business">Business</option>
+                            </select>
+                          ) : (
+                            <span className={`inline-flex items-center px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${
+                              u.plan === 'Pro' ? 'bg-purple-500/10 text-purple-400' :
+                              u.plan === 'Business' ? 'bg-blue-500/10 text-blue-400' :
+                              'bg-green-500/10 text-green-400'
+                            }`}>
+                              {u.plan}
+                            </span>
+                          )}
                         </td>
                         <td className="p-4 text-sm">
-                          <div className="flex flex-col gap-1 w-32">
-                            <span className="text-white">{u.usedCharacters} / {u.limitCharacters}</span>
-                            <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
-                              <div 
-                                className="h-full bg-brand-500" 
-                                style={{ width: `${Math.min(100, (u.usedCharacters / u.limitCharacters) * 100)}%` }}
-                              />
+                          {editingUserId === u.uid ? (
+                            <div className="flex flex-col gap-2">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs text-white/50">Used:</span>
+                                <input
+                                  type="number"
+                                  value={editForm.usedCharacters}
+                                  onChange={(e) => setEditForm({ ...editForm, usedCharacters: parseInt(e.target.value) || 0 })}
+                                  className="bg-[#0a0a0a] border border-white/10 rounded px-2 py-1 text-white text-xs w-20"
+                                />
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs text-white/50">Limit:</span>
+                                <input
+                                  type="number"
+                                  value={editForm.limitCharacters}
+                                  onChange={(e) => setEditForm({ ...editForm, limitCharacters: parseInt(e.target.value) || 0 })}
+                                  className="bg-[#0a0a0a] border border-white/10 rounded px-2 py-1 text-white text-xs w-20"
+                                />
+                              </div>
                             </div>
-                          </div>
+                          ) : (
+                            <div className="flex flex-col gap-1 w-32">
+                              <span className="text-white">{u.usedCharacters} / {u.limitCharacters}</span>
+                              <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                                <div 
+                                  className="h-full bg-brand-500" 
+                                  style={{ width: `${Math.min(100, (u.usedCharacters / u.limitCharacters) * 100)}%` }}
+                                />
+                              </div>
+                            </div>
+                          )}
                         </td>
                         <td className="p-4 text-sm text-white/60">
-                          {Math.max(0, u.limitCharacters - u.usedCharacters)} chars
+                          {editingUserId === u.uid ? (
+                            <span>{Math.max(0, editForm.limitCharacters - editForm.usedCharacters)} chars</span>
+                          ) : (
+                            <span>{Math.max(0, u.limitCharacters - u.usedCharacters)} chars</span>
+                          )}
                         </td>
                         <td className="p-4 text-right text-sm text-white/40">
-                          {u.createdAt ? new Date(u.createdAt.seconds * 1000).toLocaleDateString() : 'Just now'}
+                          {u.createdAt ? new Date(u.createdAt.seconds ? u.createdAt.seconds * 1000 : u.createdAt).toLocaleDateString() : 'Just now'}
+                        </td>
+                        <td className="p-4 text-right">
+                          <div className="flex items-center justify-end gap-2">
+                            {editingUserId === u.uid ? (
+                              <>
+                                <button
+                                  onClick={() => handleSaveEdit(u.uid)}
+                                  className="p-1.5 bg-green-500/20 text-green-400 rounded hover:bg-green-500/30 transition-colors"
+                                  title="Save"
+                                >
+                                  <Check size={14} />
+                                </button>
+                                <button
+                                  onClick={() => setEditingUserId(null)}
+                                  className="p-1.5 bg-white/10 text-white/60 rounded hover:bg-white/20 hover:text-white transition-colors"
+                                  title="Cancel"
+                                >
+                                  <X size={14} />
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  onClick={() => handleEditClick(u)}
+                                  className="p-1.5 bg-white/5 text-white/60 rounded hover:bg-white/10 hover:text-white transition-colors"
+                                  title="Edit User"
+                                >
+                                  <Edit2 size={14} />
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteUser(u.uid)}
+                                  className="p-1.5 bg-red-500/10 text-red-400 rounded hover:bg-red-500/20 transition-colors"
+                                  title="Delete User"
+                                >
+                                  <Trash2 size={14} />
+                                </button>
+                              </>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     ))
