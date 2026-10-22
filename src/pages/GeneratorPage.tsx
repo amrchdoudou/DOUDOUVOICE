@@ -15,6 +15,7 @@ const DIALECTS = [
   'Bahraini Arabic',
   'Egyptian Arabic',
   'Algerian Arabic',
+  'Algerian Kabyle (Taqbaylit)',
   'Tunisian Arabic',
   'Libyan Arabic',
   'Moroccan Arabic',
@@ -220,10 +221,40 @@ export default function GeneratorPage() {
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value.slice(0, 1000))}
-            placeholder={t('text_placeholder')}
-            dir="rtl"
-            className="flex-1 w-full bg-transparent p-6 md:p-8 text-xl md:text-2xl leading-relaxed text-white resize-none outline-none font-light placeholder:text-white/10 italic font-arabic"
+            placeholder={
+              dialect.includes('Kabyle')
+                ? "Azul fell-awen! Aru daḍris s teqbaylit neɣ s taɛrabt... (اكتب بالقبائلية هنا: أزول فلاون / Azul fell-awen)"
+                : t('text_placeholder')
+            }
+            dir={dialect.includes('Kabyle') && !/[\u0600-\u06FF]/.test(text) ? "ltr" : "rtl"}
+            className="flex-1 w-full bg-transparent p-6 md:p-8 text-xl md:text-2xl leading-relaxed text-white resize-none outline-none font-light placeholder:text-white/20 italic font-arabic"
           />
+          {dialect.includes('Kabyle') && (
+            <div className="px-4 py-2.5 bg-brand-500/5 border-t border-white/5 flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-[10px] text-brand-400 font-bold uppercase tracking-wider">💡 جرب عبارات قبائلية جاهزة:</span>
+              <button
+                type="button"
+                onClick={() => setText("Azul fell-awen! Amek tellam? Ansuf yis-wen ɣer DoudouVoice.")}
+                className="px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-white/70 hover:text-white text-[11px] transition-colors border border-white/10"
+              >
+                Azul fell-awen (ترحيب باللاتينية)
+              </button>
+              <button
+                type="button"
+                onClick={() => setText("Tanemmirt tameqqrant fell-awen, ad yelhu wass-nwen!")}
+                className="px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-white/70 hover:text-white text-[11px] transition-colors border border-white/10"
+              >
+                Tanemmirt (شكر)
+              </button>
+              <button
+                type="button"
+                onClick={() => setText("أزول فلاون، أنسوف يسون، ثانميرث أطاس ونهاركم مبروك!")}
+                className="px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-white/70 hover:text-white text-[11px] transition-colors border border-white/10"
+              >
+                أزول فلاون (بالحرف العربي)
+              </button>
+            </div>
+          )}
         </div>
 
         {error && (
