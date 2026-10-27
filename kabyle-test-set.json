@@ -1,0 +1,20 @@
+[
+  {
+    "id": "kabyle-sample-1",
+    "text": "Azul fell-awen! Amek tettilim? Yal wa s yisem-is.",
+    "region": "default",
+    "expected_note": "Warm greeting, clear spirantization and natural rhythm"
+  },
+  {
+    "id": "kabyle-sample-2",
+    "text": "Tamurt n Leqbayel d tamurt n lqedd d leɛwayed.",
+    "region": "tizi_ouzou",
+    "expected_note": "Greater Kabylia melodic cadence and ɛ / ḍ / q articulation"
+  },
+  {
+    "id": "kabyle-sample-3",
+    "text": "Afus deg ufus ad nessiweḍ ɣer lebɣi-nneɣ.",
+    "region": "bejaia",
+    "expected_note": "Lesser Kabylia rhythm and natural spirantized stops"
+  }
+]

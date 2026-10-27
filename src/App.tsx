@@ -20,6 +20,7 @@ import DashboardPage from './pages/DashboardPage';
 import TermsPage from './pages/TermsPage';
 import PrivacyPage from './pages/PrivacyPage';
 import RefundPage from './pages/RefundPage';
+import KabyleTestPage from './pages/KabyleTestPage';
 import { initMetaPixel } from './lib/MetaPixel';
 
 const paypalOptions = {
@@ -60,6 +61,9 @@ export default function App() {
                   <Route path="/privacy-policy" element={<Navigate to="/privacy" replace />} />
                   <Route path="/refund" element={<RefundPage />} />
                   <Route path="/refund-policy" element={<Navigate to="/refund" replace />} />
+                  {Boolean((import.meta as any).env?.DEV) && (
+                    <Route path="/kabyle-test" element={<KabyleTestPage />} />
+                  )}
                 </Routes>
                 </div>
               </main>

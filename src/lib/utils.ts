@@ -24,7 +24,7 @@ export function getDialectFlag(dialect: string): string {
     case 'Algerian Arabic':
       return '🇩🇿';
     case 'Algerian Kabyle (Taqbaylit)':
-      return '🇩🇿 ⵣ';
+      return '🇩🇿';
     case 'Tunisian Arabic':
       return '🇹🇳';
     case 'Libyan Arabic':

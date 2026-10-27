@@ -1,10 +1,11 @@
 import { useState, useRef } from 'react';
 import { motion } from 'motion/react';
-import { Play, Pause, Download, Loader2, Settings2, History } from 'lucide-react';
+import { Play, Pause, Download, Loader2, Settings2, History, Info, Sparkles } from 'lucide-react';
 import { useAuth } from '../lib/AuthContext';
 import { useLanguage } from '../lib/LanguageContext';
 import { getDialectFlag } from '../lib/utils';
 import { trackMetaCustomEvent } from '../lib/MetaPixel';
+import { detectScript, KABYLE_REGIONS, VALID_KABYLE_REGIONS } from '../lib/kabyle';
 
 const DIALECTS = [
   'Saudi Arabic',
@@ -39,11 +40,18 @@ const VOICES = {
   female: ['Kore', 'Charon', 'Aoede']
 };
 
+const KABYLE_SAMPLE_SENTENCES = [
+  '[KABYLE_SAMPLE_1]',
+  '[KABYLE_SAMPLE_2]',
+  '[KABYLE_SAMPLE_3]'
+];
+
 export default function GeneratorPage() {
   const { user, userData, refreshUserData } = useAuth();
-  const { t } = useLanguage();
+  const { t, language } = useLanguage();
   const [text, setText] = useState('');
   const [dialect, setDialect] = useState(DIALECTS[0]);
+  const [kabyleRegion, setKabyleRegion] = useState<string>('default');
   const [style, setStyle] = useState(STYLES[0]);
   const [gender, setGender] = useState<'male' | 'female'>('male');
   const [voice, setVoice] = useState(VOICES.male[0]);
@@ -56,6 +64,25 @@ export default function GeneratorPage() {
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
+
+  const isKabyle = dialect === 'Algerian Kabyle (Taqbaylit)';
+  const currentScript = detectScript(text);
+
+  // Direction calculation
+  let textDirection: 'rtl' | 'ltr' = 'rtl';
+  if (isKabyle) {
+    if (currentScript === 'arabic') {
+      textDirection = 'rtl';
+    } else {
+      textDirection = 'ltr';
+    }
+  } else {
+    if (currentScript === 'latin') {
+      textDirection = 'ltr';
+    } else {
+      textDirection = 'rtl';
+    }
+  }
 
   const handleGenerate = async () => {
     if (!text.trim()) return;
@@ -93,7 +120,14 @@ export default function GeneratorPage() {
           'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
-          text, dialect, style, voice, speed, pitch, emotion
+          text,
+          dialect,
+          style,
+          voice,
+          speed,
+          pitch,
+          emotion,
+          kabyleRegion: isKabyle ? kabyleRegion : undefined
         })
       });
       
@@ -123,7 +157,7 @@ export default function GeneratorPage() {
             },
             body: JSON.stringify({
               text,
-              language: dialect,
+              language: isKabyle ? `Kabyle (${kabyleRegion})` : dialect,
               voice,
               audioUrl: data.audio
             })
@@ -187,7 +221,7 @@ export default function GeneratorPage() {
   return (
     <div className="flex-1 flex flex-col md:flex-row h-full overflow-y-auto md:overflow-hidden">
       
-      {/* Settings Panel Left (originally Dialects) */}
+      {/* Settings Panel Left (Dialects) */}
       <aside className="w-full md:w-72 border-b md:border-b-0 md:border-r border-white/10 bg-[#080808] flex-col shrink-0 overflow-y-auto hidden md:flex">
         <div className="p-4 border-b border-white/5">
           <label className="text-[10px] uppercase tracking-widest text-white/40 font-bold block mb-3" dir="ltr">{t('select_dialect')}</label>
@@ -210,10 +244,45 @@ export default function GeneratorPage() {
       </aside>
 
       {/* Central Editor Area */}
-      <section className="flex-none md:flex-1 flex flex-col p-4 md:p-6 gap-6 relative md:overflow-y-auto bg-[#050505] min-h-[500px] md:min-h-0">
+      <section className="flex-none md:flex-1 flex flex-col p-4 md:p-6 gap-4 relative md:overflow-y-auto bg-[#050505] min-h-[500px] md:min-h-0">
+        
+        {/* Kabyle Helper Banner & Examples */}
+        {isKabyle && (
+          <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-200/90 text-xs flex flex-col gap-2.5 shadow-sm">
+            <div className="flex items-center gap-2">
+              <Info size={15} className="text-amber-400 shrink-0" />
+              <p className="leading-relaxed font-medium">
+                {t('kabyle_script_hint')}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-amber-500/10" dir="ltr">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-amber-400/80 flex items-center gap-1">
+                <Sparkles size={11} /> {t('kabyle_samples')}
+              </span>
+              {KABYLE_SAMPLE_SENTENCES.map((sample, idx) => (
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={() => setText(sample)}
+                  className="px-2.5 py-1 rounded bg-black/40 hover:bg-black/70 border border-amber-500/30 text-[11px] text-amber-100 font-mono transition-colors"
+                >
+                  {sample}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="flex-1 flex flex-col bg-white/[0.02] border border-white/10 rounded-xl overflow-hidden shadow-2xl min-h-[300px]">
           <div className="flex items-center justify-between px-4 py-2 bg-white/5 border-b border-white/10" dir="ltr">
-            <span className="text-[10px] uppercase tracking-widest text-white/40 font-bold">{t('text_area')}</span>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] uppercase tracking-widest text-white/40 font-bold">{t('text_area')}</span>
+              {isKabyle && (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-white/10 text-white/60 font-mono uppercase">
+                  Script: {currentScript}
+                </span>
+              )}
+            </div>
             <div className="flex gap-4">
               <span className="text-[10px] text-white/30 font-mono">{t('chars')}: {text.length}/1000</span>
             </div>
@@ -221,40 +290,15 @@ export default function GeneratorPage() {
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value.slice(0, 1000))}
-            placeholder={
-              dialect.includes('Kabyle')
-                ? "Azul fell-awen! Aru daḍris s teqbaylit neɣ s taɛrabt... (اكتب بالقبائلية هنا: أزول فلاون / Azul fell-awen)"
-                : t('text_placeholder')
-            }
-            dir={dialect.includes('Kabyle') && !/[\u0600-\u06FF]/.test(text) ? "ltr" : "rtl"}
-            className="flex-1 w-full bg-transparent p-6 md:p-8 text-xl md:text-2xl leading-relaxed text-white resize-none outline-none font-light placeholder:text-white/20 italic font-arabic"
+            placeholder={t('text_placeholder')}
+            dir={textDirection}
+            style={{
+              fontFamily: currentScript === 'tifinagh'
+                ? "'Noto Sans Tifinagh', 'Segoe UI Historic', sans-serif"
+                : undefined
+            }}
+            className="flex-1 w-full bg-transparent p-6 md:p-8 text-xl md:text-2xl leading-relaxed text-white resize-none outline-none font-light placeholder:text-white/10 italic"
           />
-          {dialect.includes('Kabyle') && (
-            <div className="px-4 py-2.5 bg-brand-500/5 border-t border-white/5 flex flex-wrap items-center gap-2 text-xs">
-              <span className="text-[10px] text-brand-400 font-bold uppercase tracking-wider">💡 جرب عبارات قبائلية جاهزة:</span>
-              <button
-                type="button"
-                onClick={() => setText("Azul fell-awen! Amek tellam? Ansuf yis-wen ɣer DoudouVoice.")}
-                className="px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-white/70 hover:text-white text-[11px] transition-colors border border-white/10"
-              >
-                Azul fell-awen (ترحيب باللاتينية)
-              </button>
-              <button
-                type="button"
-                onClick={() => setText("Tanemmirt tameqqrant fell-awen, ad yelhu wass-nwen!")}
-                className="px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-white/70 hover:text-white text-[11px] transition-colors border border-white/10"
-              >
-                Tanemmirt (شكر)
-              </button>
-              <button
-                type="button"
-                onClick={() => setText("أزول فلاون، أنسوف يسون، ثانميرث أطاس ونهاركم مبروك!")}
-                className="px-2 py-1 rounded bg-white/5 hover:bg-white/10 text-white/70 hover:text-white text-[11px] transition-colors border border-white/10"
-              >
-                أزول فلاون (بالحرف العربي)
-              </button>
-            </div>
-          )}
         </div>
 
         {error && (
@@ -271,7 +315,6 @@ export default function GeneratorPage() {
           <div className="flex flex-col gap-1 flex-1 w-full hidden md:flex">
             <label className="text-[9px] uppercase tracking-tighter text-white/30 font-bold">{t('audio_ready')}</label>
             <div className="flex items-end gap-[2px] h-10 w-full">
-              {/* Fake waveform for visual aesthetic matching the design */}
               {[2,4,8,5,3,10,6,8,3,1,2,4,2,1,5,3].map((h, i) => (
                 <div key={i} className={`w-1 ${audioUrl ? 'bg-brand-500' : 'bg-white/5'} transition-all duration-500`} style={{height: `${h*4}px`}}></div>
               ))}
@@ -352,10 +395,11 @@ export default function GeneratorPage() {
       </section>
 
       {/* Settings Panel Right */}
-      <aside className="w-full md:w-80 border-t md:border-t-0 md:border-l border-white/10 bg-[#080808] p-6 flex flex-col gap-8 shrink-0 md:overflow-y-auto" dir="ltr">
+      <aside className="w-full md:w-80 border-t md:border-t-0 md:border-l border-white/10 bg-[#080808] p-6 flex flex-col gap-6 shrink-0 md:overflow-y-auto" dir="ltr">
         
-        <div className="md:hidden mb-2">
-          <label className="text-[10px] uppercase tracking-widest text-white/40 font-bold block mb-4">{t('select_dialect')}</label>
+        {/* Mobile Dialect selector */}
+        <div className="md:hidden">
+          <label className="text-[10px] uppercase tracking-widest text-white/40 font-bold block mb-2">{t('select_dialect')}</label>
           <select 
             value={dialect}
             onChange={(e) => setDialect(e.target.value)}
@@ -364,6 +408,29 @@ export default function GeneratorPage() {
             {DIALECTS.map(d => <option key={d} value={d} className="bg-black">{getDialectFlag(d)} {t(d)}</option>)}
           </select>
         </div>
+
+        {/* Kabyle Regional Variant Selector (Visible ONLY when Kabyle is selected) */}
+        {isKabyle && (
+          <div className="p-3.5 rounded-lg bg-white/[0.03] border border-brand-500/30">
+            <label className="text-[10px] uppercase tracking-widest text-brand-400 font-bold block mb-2">
+              {t('kabyle_region')}
+            </label>
+            <select
+              value={kabyleRegion}
+              onChange={(e) => setKabyleRegion(e.target.value)}
+              className="w-full rounded bg-white/5 border border-white/20 px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none"
+            >
+              {VALID_KABYLE_REGIONS.map((regId) => {
+                const regInfo = KABYLE_REGIONS[regId];
+                return (
+                  <option key={regId} value={regId} className="bg-black text-white">
+                    {language === 'ar' ? regInfo.labelAr : regInfo.labelEn}
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+        )}
 
         <div>
           <label className="text-[10px] uppercase tracking-widest text-white/40 font-bold block mb-4">{t('voice_profile')}</label>
