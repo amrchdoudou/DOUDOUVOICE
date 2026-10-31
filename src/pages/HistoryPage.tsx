@@ -1,8 +1,8 @@
 import { useEffect, useState, useRef } from 'react';
 import { useAuth } from '../lib/AuthContext';
 import { useLanguage } from '../lib/LanguageContext';
-import { Play, Pause, Download, Trash2, Clock, Loader2 } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { Play, Pause, Download, Trash2, Clock, Loader2, Sliders } from 'lucide-react';
+import { Link, useNavigate } from 'react-router-dom';
 import { getDialectFlag } from '../lib/utils';
 
 interface HistoryItem {
@@ -18,6 +18,7 @@ interface HistoryItem {
 export default function HistoryPage() {
   const { user, userData } = useAuth();
   const { t } = useLanguage();
+  const navigate = useNavigate();
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [playingId, setPlayingId] = useState<string | null>(null);
@@ -25,6 +26,35 @@ export default function HistoryPage() {
   const [loadingAudioId, setLoadingAudioId] = useState<string | null>(null);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
   const currentPlayRequestRef = useRef<string | null>(null);
+
+  const handleGoToStudio = (item: HistoryItem) => {
+    navigate('/generator', {
+      state: {
+        text: item.text,
+        dialect: item.dialect,
+        style: item.style,
+        voice: item.voice,
+        audioUrl: item.audioUrl,
+        openMeta: false
+      }
+    });
+  };
+
+  const handleGoToMeta = (item: HistoryItem) => {
+    navigate('/generator', {
+      state: {
+        text: item.text,
+        dialect: item.dialect,
+        style: item.style,
+        voice: item.voice,
+        audioUrl: item.audioUrl,
+        openMeta: true,
+        metaInitialText: item.text,
+        metaInitialDialect: item.dialect,
+        metaInitialTone: item.style
+      }
+    });
+  };
 
   useEffect(() => {
     return () => {
@@ -249,33 +279,59 @@ export default function HistoryPage() {
                   <span className="rounded border border-brand-500/30 bg-brand-500/10 text-brand-500 px-2 py-1">{t(item.voice)}</span>
                 </div>
               </div>
-              <div className="flex items-center gap-3 self-end sm:self-auto">
+              <div className="flex items-center gap-2 self-end sm:self-auto flex-wrap">
+                {/* Go to Studio Button */}
+                <button 
+                  type="button"
+                  onClick={() => handleGoToStudio(item)}
+                  className="h-9 px-3 rounded-xl border border-brand-500/30 bg-gradient-to-r from-brand-500/15 to-amber-500/10 hover:from-brand-500/25 hover:to-amber-500/20 text-brand-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 transition-all shadow-sm group"
+                  title={t('open_in_studio_tooltip')}
+                >
+                  <Sliders size={13} className="text-brand-400 group-hover:scale-110 transition-transform" />
+                  <span>{t('go_to_studio')}</span>
+                </button>
+
+                {/* Go to Meta Button */}
+                <button 
+                  type="button"
+                  onClick={() => handleGoToMeta(item)}
+                  className="h-9 px-3 rounded-xl border border-blue-400/40 bg-[#0866FF]/20 hover:bg-[#0866FF]/35 text-blue-200 hover:text-white text-xs font-semibold flex items-center gap-1.5 transition-all shadow-[0_0_12px_rgba(8,102,255,0.3)] group"
+                  title={t('edit_with_meta_tooltip')}
+                >
+                  <svg className="w-3.5 h-2 text-blue-300 group-hover:text-white fill-current shrink-0 transition-colors" viewBox="0 0 24 12" aria-hidden="true">
+                    <path d="M11.996 3.125c-1.89-2.07-4.66-2.92-7.16-2.05-3.37 1.17-4.8 5.43-2.3 8.35 1.83 2.14 4.8 2.8 7.42 1.34l.04-.03.04.03c2.62 1.46 5.59.8 7.42-1.34 2.5-2.92 1.07-7.18-2.3-8.35-2.5-.87-5.27-.02-7.16 2.05z" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                  <span>{t('go_to_meta')}</span>
+                </button>
+
+                <div className="h-5 w-[1px] bg-white/10 hidden sm:block mx-0.5" />
+
                 <button 
                   onClick={() => playAudio(item.id, item.audioUrl)}
                   disabled={loadingAudioId === item.id}
-                  className={`flex h-10 w-10 items-center justify-center rounded-full transition-colors ${playingId === item.id ? 'bg-brand-500 text-black shadow-[0_0_15px_rgba(245,158,11,0.5)] border-brand-500' : 'border border-white/20 bg-white/5 text-white hover:bg-white/10'} disabled:opacity-50`}
+                  className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors ${playingId === item.id ? 'bg-brand-500 text-black shadow-[0_0_15px_rgba(245,158,11,0.5)] border-brand-500' : 'border border-white/20 bg-white/5 text-white hover:bg-white/10'} disabled:opacity-50`}
                   title={playingId === item.id ? t('pause') : t('play')}
                 >
                   {loadingAudioId === item.id ? (
-                    <Loader2 size={16} className="animate-spin" />
+                    <Loader2 size={15} className="animate-spin" />
                   ) : playingId === item.id ? (
-                    <Pause size={16} />
+                    <Pause size={15} />
                   ) : (
-                    <Play size={16} className="ml-0.5" />
+                    <Play size={15} className="ml-0.5" />
                   )}
                 </button>
                 {userData?.plan === 'Free' ? (
                   <button 
                     onClick={() => alert(t('upgrade_download'))}
-                    className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 text-white/20 cursor-not-allowed"
+                    className="flex h-9 w-9 items-center justify-center rounded-full border border-white/10 text-white/20 cursor-not-allowed"
                     title={t('upgrade_download')}
                   >
-                    <Download size={16} />
+                    <Download size={14} />
                   </button>
                 ) : (
                   <button 
                     onClick={() => handleDownload(loadedAudios[item.id] || item.audioUrl, "doudouvoice-generation.wav")}
-                    className="flex h-10 px-2 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white hover:bg-white/10 gap-0.5"
+                    className="flex h-9 px-2.5 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white hover:bg-white/10 gap-0.5"
                     title="Download WAV"
                   >
                     <Download size={12} />
@@ -284,10 +340,10 @@ export default function HistoryPage() {
                 )}
                 <button 
                   onClick={() => handleDelete(item.id)}
-                  className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-white/5 text-red-500 transition-colors hover:bg-red-500/10 hover:border-red-500/50"
+                  className="flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-white/5 text-red-500 transition-colors hover:bg-red-500/10 hover:border-red-500/50"
                   title={t('delete')}
                 >
-                  <Trash2 size={16} />
+                  <Trash2 size={15} />
                 </button>
               </div>
             </div>

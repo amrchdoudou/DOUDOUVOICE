@@ -39,6 +39,10 @@ export function getDialectFlag(dialect: string): string {
       return '🇵🇸';
     case 'Neutral Middle Eastern Arabic':
       return '🌐';
+    case 'American English (US)':
+      return '🇺🇸';
+    case 'British English (UK)':
+      return '🇬🇧';
     default:
       return '🌐';
   }

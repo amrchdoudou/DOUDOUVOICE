@@ -1,4 +1,5 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
+import { useLocation } from 'react-router-dom';
 import { motion } from 'motion/react';
 import { Play, Pause, Download, Loader2, Settings2, History, Info, Sparkles } from 'lucide-react';
 import { useAuth } from '../lib/AuthContext';
@@ -6,8 +7,11 @@ import { useLanguage } from '../lib/LanguageContext';
 import { getDialectFlag } from '../lib/utils';
 import { trackMetaCustomEvent } from '../lib/MetaPixel';
 import { detectScript, KABYLE_REGIONS, VALID_KABYLE_REGIONS } from '../lib/kabyle';
+import ScriptwriterModal from '../components/ScriptwriterModal';
 
 const DIALECTS = [
+  'American English (US)',
+  'British English (UK)',
   'Saudi Arabic',
   'Emirati Arabic (Dubai / UAE)',
   'Omani Arabic',
@@ -32,13 +36,40 @@ const STYLES = [
   'Friendly',
   'Storytelling',
   'Energetic sales',
-  'Luxury brand voice'
+  'Luxury brand voice',
+  'Presentation'
 ];
 
 const VOICES = {
   male: ['Puck', 'Fenrir', 'Zephyr'],
   female: ['Kore', 'Charon', 'Aoede']
 };
+
+const ENGLISH_SAMPLE_SCRIPT = `[sentence: 1]
+[pace: fast]
+Are you tired of your phone falling between your car seat and the dashboard?
+
+[pause: 2s]
+
+[sentence: 2]
+[pace: slow]
+Meet MagnaDrive. Keep your phone right in front of you while you drive.
+
+[pause: 1s]
+
+[sound: excited]
+Wow!
+
+[pause: 1s]
+
+[sound: laugh]
+Hahaha!
+
+[sentence: 3]
+[pace: normal]
+Make every drive more organized. Get yours today!`;
+
+const ENGLISH_PLAIN_SAMPLE = `Meet MagnaDrive: the ultimate magnetic car phone mount engineered for smooth, safe, and hands-free driving on every journey.`;
 
 const KABYLE_SAMPLE_SENTENCES = [
   '[KABYLE_SAMPLE_1]',
@@ -63,14 +94,58 @@ export default function GeneratorPage() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isScriptwriterOpen, setIsScriptwriterOpen] = useState(false);
+  const [metaInitialText, setMetaInitialText] = useState<string>('');
+  const [metaInitialTone, setMetaInitialTone] = useState<string>('');
   const audioRef = useRef<HTMLAudioElement>(null);
+  const location = useLocation();
 
+  useEffect(() => {
+    if (location.state) {
+      const s = location.state as any;
+      if (s.text) {
+        setText(s.text);
+      }
+      if (s.dialect && DIALECTS.includes(s.dialect)) {
+        setDialect(s.dialect);
+      }
+      if (s.style && STYLES.includes(s.style)) {
+        setStyle(s.style);
+      }
+      if (s.voice) {
+        if (VOICES.male.includes(s.voice)) {
+          setGender('male');
+          setVoice(s.voice);
+        } else if (VOICES.female.includes(s.voice)) {
+          setGender('female');
+          setVoice(s.voice);
+        }
+      }
+      if (s.audioUrl) {
+        setAudioUrl(s.audioUrl);
+      }
+      if (s.openMeta) {
+        setMetaInitialText(s.metaInitialText || s.text || '');
+        setMetaInitialTone(s.metaInitialTone || s.style || '');
+        setIsScriptwriterOpen(true);
+      }
+      try {
+        window.history.replaceState({}, document.title);
+      } catch (e) {
+        // ignore in mock environments
+      }
+    }
+  }, [location.state]);
+
+  const isEnglish = dialect === 'American English (US)' || dialect === 'British English (UK)';
   const isKabyle = dialect === 'Algerian Kabyle (Taqbaylit)';
   const currentScript = detectScript(text);
 
   // Direction calculation
   let textDirection: 'rtl' | 'ltr' = 'rtl';
-  if (isKabyle) {
+  if (isEnglish) {
+    textDirection = 'ltr';
+  } else if (isKabyle) {
     if (currentScript === 'arabic') {
       textDirection = 'rtl';
     } else {
@@ -246,6 +321,24 @@ export default function GeneratorPage() {
       {/* Central Editor Area */}
       <section className="flex-none md:flex-1 flex flex-col p-4 md:p-6 gap-4 relative md:overflow-y-auto bg-[#050505] min-h-[500px] md:min-h-0">
         
+        {/* Top Studio Actions (Meta AI Scriptwriter Button) */}
+        <div className="flex items-center justify-between pb-1">
+          <button
+            type="button"
+            onClick={() => setIsScriptwriterOpen(true)}
+            className="px-3.5 py-2 rounded-xl bg-gradient-to-r from-brand-500/20 to-amber-500/10 hover:from-brand-500/30 hover:to-amber-500/20 border border-brand-500/30 text-white text-xs font-semibold flex items-center gap-2 shadow-sm transition-all"
+          >
+            <Sparkles size={15} className="text-brand-400" />
+            <span>{t('open_scriptwriter')}</span>
+            <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-[#0866FF] text-white border border-blue-400/40 shadow-[0_0_12px_rgba(8,102,255,0.45)] font-bold flex items-center gap-1.5 transition-all">
+              <svg className="w-3 h-2 text-white fill-current inline-block" viewBox="0 0 24 12" aria-hidden="true">
+                <path d="M11.996 3.125c-1.89-2.07-4.66-2.92-7.16-2.05-3.37 1.17-4.8 5.43-2.3 8.35 1.83 2.14 4.8 2.8 7.42 1.34l.04-.03.04.03c2.62 1.46 5.59.8 7.42-1.34 2.5-2.92 1.07-7.18-2.3-8.35-2.5-.87-5.27-.02-7.16 2.05z" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              Meta AI
+            </span>
+          </button>
+        </div>
+        
         {/* Kabyle Helper Banner & Examples */}
         {isKabyle && (
           <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-200/90 text-xs flex flex-col gap-2.5 shadow-sm">
@@ -273,6 +366,37 @@ export default function GeneratorPage() {
           </div>
         )}
 
+        {/* English Helper Banner & Quick Templates */}
+        {isEnglish && (
+          <div className="p-3.5 rounded-xl bg-blue-500/10 border border-blue-500/20 text-blue-200/90 text-xs flex flex-col gap-2.5 shadow-sm">
+            <div className="flex items-center gap-2">
+              <Info size={15} className="text-blue-400 shrink-0" />
+              <p className="leading-relaxed font-medium">
+                {dialect === 'British English (UK)' ? '🇬🇧 British English (UK)' : '🇺🇸 American English (US)'} Voice Studio. Supports plain text and structured scripts with pauses (<code className="text-blue-300">[pause: 2s]</code>), pacing (<code className="text-blue-300">[pace: fast]</code>), and expressive sounds (<code className="text-blue-300">[sound: excited]</code>).
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-blue-500/10" dir="ltr">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-blue-400/80 flex items-center gap-1">
+                <Sparkles size={11} /> Quick Samples:
+              </span>
+              <button
+                type="button"
+                onClick={() => setText(ENGLISH_SAMPLE_SCRIPT)}
+                className="px-2.5 py-1 rounded bg-black/40 hover:bg-black/70 border border-blue-500/30 text-[11px] text-blue-100 font-mono transition-colors flex items-center gap-1"
+              >
+                <span>Structured Script (Pacing & Pauses)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setText(ENGLISH_PLAIN_SAMPLE)}
+                className="px-2.5 py-1 rounded bg-black/40 hover:bg-black/70 border border-blue-500/30 text-[11px] text-blue-100 font-mono transition-colors"
+              >
+                <span>Standard Ad Copy</span>
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="flex-1 flex flex-col bg-white/[0.02] border border-white/10 rounded-xl overflow-hidden shadow-2xl min-h-[300px]">
           <div className="flex items-center justify-between px-4 py-2 bg-white/5 border-b border-white/10" dir="ltr">
             <div className="flex items-center gap-2">
@@ -290,7 +414,7 @@ export default function GeneratorPage() {
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value.slice(0, 1000))}
-            placeholder={t('text_placeholder')}
+            placeholder={isEnglish ? "Type or paste English voice-over copy or structured script with [sentence: 1], [pace: fast], [pause: 2s], [sound: excited]..." : t('text_placeholder')}
             dir={textDirection}
             style={{
               fontFamily: currentScript === 'tifinagh'
@@ -524,6 +648,32 @@ export default function GeneratorPage() {
           )}
         </div>
       </aside>
+
+      <ScriptwriterModal
+        isOpen={isScriptwriterOpen}
+        onClose={() => {
+          setIsScriptwriterOpen(false);
+          setMetaInitialText('');
+        }}
+        currentDialect={dialect}
+        initialText={metaInitialText}
+        initialTone={metaInitialTone}
+        onApplyToTts={(params) => {
+          setText(params.text);
+          if (params.dialect && DIALECTS.includes(params.dialect)) {
+            setDialect(params.dialect);
+          }
+          if (params.style && STYLES.includes(params.style)) {
+            setStyle(params.style);
+          }
+          if (params.emotion) {
+            setEmotion(params.emotion);
+          }
+          if (params.speed) {
+            setSpeed(params.speed);
+          }
+        }}
+      />
     </div>
   );
 }
