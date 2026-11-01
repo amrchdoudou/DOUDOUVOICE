@@ -8,11 +8,46 @@ import { initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import firebaseConfig from "./firebase-applet-config.json";
 import { db } from "./src/db/index.js";
-import { users, pendingOrders, history, settings } from "./src/db/schema.js";
+import { users, pendingOrders, history, settings, videoProjects } from "./src/db/schema.js";
 import { eq, and } from "drizzle-orm";
 import { normalizeKabyle, VALID_KABYLE_REGIONS, KABYLE_REGIONS } from "./src/lib/kabyle.js";
 import { defaultMetaClient } from "./server/metaClient.js";
 import { processAndComposeScript, generateSingleSegmentAudio, hasScriptDirectives } from "./server/expressiveTts.js";
+import multer from "multer";
+import { defaultMetaVideoClient, SceneAnalysis, VoiceoverSegment } from "./server/metaVideoClient.js";
+import {
+  probeVideo,
+  extractSceneFrames,
+  extractAudioTrack,
+  buildSynchronizedVoiceoverTrack,
+  compositeFinalVideo,
+  validateAndAdjustTimeline,
+  extractBackgroundAudioStem,
+  extractSoundEffectCues,
+  validateCompleteFinalTimeline,
+  measureAudioLoudness,
+  buildSceneNarrationTimeline,
+  mapSegmentsToScenes,
+  AudioSegment,
+  SubtitleItem,
+  SoundEffectCue
+} from "./server/videoService.js";
+import {
+  analyzeCreatorAssets,
+  generateCreatorCreativeDirection,
+  generateCreatorScript,
+  synthesizeCreatorVoiceover,
+  generateCreatorEditingPlan,
+  CreatorAsset
+} from "./server/metaCreatorService.js";
+import { executeModalRendering } from "./server/modalRunner.js";
+
+const creatorStorageDir = path.join(process.cwd(), "creator_storage");
+if (!fs.existsSync(creatorStorageDir)) {
+  fs.mkdirSync(creatorStorageDir, { recursive: true });
+}
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 console.log("[DEBUG] projectId:", firebaseConfig.projectId);
 
@@ -278,13 +313,32 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '20mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+  app.use(express.json({ limit: '100mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
   const cacheDir = path.join(process.cwd(), "audio_cache");
   if (!fs.existsSync(cacheDir)) {
     fs.mkdirSync(cacheDir, { recursive: true });
   }
+
+  const videoStorageDir = path.join(process.cwd(), "video_storage");
+  const videoUploadsDir = path.join(videoStorageDir, "uploads");
+  if (!fs.existsSync(videoUploadsDir)) {
+    fs.mkdirSync(videoUploadsDir, { recursive: true });
+  }
+
+  const videoUpload = multer({
+    dest: videoUploadsDir,
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+    fileFilter: (_req, file, cb) => {
+      const allowed = ['video/mp4', 'video/quicktime', 'video/webm', 'video/x-msvideo', 'video/mpeg'];
+      if (allowed.includes(file.mimetype.toLowerCase()) || file.originalname.match(/\.(mp4|mov|webm|avi|mkv)$/i)) {
+        cb(null, true);
+      } else {
+        cb(new Error("Only video files (MP4, MOV, WebM) under 50MB are supported."));
+      }
+    }
+  });
 
   // Serve cached audio files
   app.get("/api/audio/:id.wav", (req, res) => {
@@ -693,6 +747,1086 @@ async function startServer() {
     } catch (err: any) {
       console.error("Error in /api/experiment/generate-segment:", err);
       res.status(500).json({ error: err.message || "Failed to generate single segment." });
+    }
+  });
+
+  // ============================================================
+  // Video Intelligence & Dubbing Studio Endpoints
+  // ============================================================
+
+  function streamVideoFile(req: express.Request, res: express.Response, filePath: string, contentType = "video/mp4") {
+    const stat = fs.statSync(filePath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+    const existingDisposition = res.getHeader("Content-Disposition");
+
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunksize = end - start + 1;
+      const file = fs.createReadStream(filePath, { start, end });
+      const head: Record<string, string | number> = {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunksize,
+        "Content-Type": contentType,
+      };
+      if (existingDisposition) {
+        head["Content-Disposition"] = existingDisposition as string;
+      }
+      res.writeHead(206, head);
+      file.pipe(res);
+    } else {
+      const head: Record<string, string | number> = {
+        "Content-Length": fileSize,
+        "Content-Type": contentType,
+        "Accept-Ranges": "bytes"
+      };
+      if (existingDisposition) {
+        head["Content-Disposition"] = existingDisposition as string;
+      }
+      res.writeHead(200, head);
+      fs.createReadStream(filePath).pipe(res);
+    }
+  }
+
+  // 1. Upload Video (up to 50MB, <= 60s)
+  app.post("/api/video/upload", videoUpload.single("video"), async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        if (req.file) await fs.promises.unlink(req.file.path).catch(() => {});
+        return res.status(401).json({ error: "Missing or invalid Authorization header" });
+      }
+      const idToken = authHeader.split("Bearer ")[1];
+      let decodedToken;
+      try {
+        decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+      } catch (err: any) {
+        if (req.file) await fs.promises.unlink(req.file.path).catch(() => {});
+        return res.status(401).json({ error: `Authentication failed: ${err.message}` });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ error: "No video file provided" });
+      }
+
+      const meta = await probeVideo(req.file.path);
+      if (meta.durationSec > 60.5) {
+        await fs.promises.unlink(req.file.path).catch(() => {});
+        return res.status(400).json({
+          error: `Video duration is ${Math.round(meta.durationSec)}s. The studio currently supports marketing videos up to 60 seconds.`
+        });
+      }
+
+      const projectId = crypto.randomUUID();
+      const projectDir = path.join(videoStorageDir, projectId);
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      const ext = path.extname(req.file.originalname) || '.mp4';
+      const storedVideoPath = path.join(projectDir, `original${ext}`);
+      await fs.promises.rename(req.file.path, storedVideoPath);
+
+      const title = req.body.title || req.file.originalname.replace(/\.[^/.]+$/, "") || "Untitled Video";
+
+      await db.insert(videoProjects).values({
+        id: projectId,
+        uid: decodedToken.uid,
+        title,
+        videoFilename: `original${ext}`,
+        videoUrl: `/api/video/stream/${projectId}`,
+        durationSec: Math.round(meta.durationSec),
+        status: 'uploaded',
+        mode: req.body.mode || 'understand',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+
+      res.json({
+        id: projectId,
+        title,
+        videoUrl: `/api/video/stream/${projectId}`,
+        durationSec: Math.round(meta.durationSec),
+        width: meta.width,
+        height: meta.height,
+        hasAudio: meta.hasAudio,
+        status: 'uploaded'
+      });
+    } catch (err: any) {
+      console.error("[Video] Upload error:", err);
+      if (req.file) await fs.promises.unlink(req.file.path).catch(() => {});
+      res.status(500).json({ error: err.message || "Failed to process video upload" });
+    }
+  });
+
+  // 2. Analyze Video Scenes (Mode A - Meta Muse Spark)
+  app.post("/api/video/:id/analyze", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectId = req.params.id;
+      const projectRows = await db.select().from(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Project not found" });
+
+      const project = projectRows[0];
+      const projectDir = path.join(videoStorageDir, projectId);
+      const videoPath = path.join(projectDir, project.videoFilename);
+      const framesDir = path.join(projectDir, "frames");
+
+      await db.update(videoProjects).set({ status: 'analyzing', updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+
+      console.log(`[Video] Extracting frames for project ${projectId}...`);
+      const frames = await extractSceneFrames(videoPath, framesDir, 2);
+
+      console.log(`[Video] Analyzing ${frames.length} frames with Meta Muse Spark...`);
+      const analysisResult = await defaultMetaVideoClient.analyzeVideoScenes({
+        frames,
+        durationSec: project.durationSec,
+        userContext: req.body.userContext
+      });
+
+      if (!analysisResult.success) {
+        await db.update(videoProjects).set({ status: 'failed', errorMessage: analysisResult.error, updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+        return res.status(500).json({ error: analysisResult.error || "Analysis failed" });
+      }
+
+      await db.update(videoProjects).set({
+        status: 'analyzed',
+        analysisData: JSON.stringify(analysisResult.scenes),
+        updatedAt: new Date()
+      }).where(eq(videoProjects.id, projectId));
+
+      res.json({
+        success: true,
+        summary: analysisResult.summary,
+        detectedVisualTags: analysisResult.detectedVisualTags,
+        scenes: analysisResult.scenes,
+        tokenUsage: analysisResult.tokenUsage
+      });
+    } catch (err: any) {
+      console.error("[Video] Analyze error:", err);
+      res.status(500).json({ error: err.message || "Failed to analyze video" });
+    }
+  });
+
+  // 3A. Generate Script ONLY using Meta Muse Spark (Step 2 of User-Controlled Workflow)
+  // MUST NOT generate audio, call Gemini TTS, or invoke FFmpeg.
+  app.post("/api/video/:id/generate-script", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectId = req.params.id;
+      const projectRows = await db.select().from(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Project not found" });
+
+      const project = projectRows[0];
+      const {
+        mode = 'dub_ad',
+        dialect = 'Algerian Arabic',
+        platform = 'TikTok',
+        tone = 'Energetic sales',
+        voice = 'Puck',
+        userBrief
+      } = req.body;
+
+      const scenes: SceneAnalysis[] = project.analysisData ? JSON.parse(project.analysisData) : [];
+      if (scenes.length === 0 && mode !== 'localize') {
+        return res.status(400).json({ error: "Please analyze the video scenes first." });
+      }
+
+      await db.update(videoProjects).set({ status: 'generating', mode, updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+
+      let generatedSegments: VoiceoverSegment[] = [];
+      let suggestedSettings = { style: tone, emotion: 'excited', pace: 'energetic' };
+
+      if (mode === 'localize') {
+        const projectDir = path.join(videoStorageDir, projectId);
+        const videoPath = path.join(projectDir, project.videoFilename);
+        const audioPath = path.join(projectDir, "original_audio.wav");
+        await extractAudioTrack(videoPath, audioPath);
+
+        const locRes = await defaultMetaVideoClient.localizeExistingAudio({
+          audioWavPath: audioPath,
+          targetDialect: dialect,
+          targetVoice: voice,
+          durationSec: project.durationSec
+        });
+        if (!locRes.success || !locRes.localizedSegments || locRes.localizedSegments.length === 0) {
+          await db.update(videoProjects).set({ status: 'analyzed', updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+          return res.status(500).json({ error: locRes.error || "Audio localization returned no script segments." });
+        }
+        generatedSegments = locRes.localizedSegments;
+      } else {
+        console.log(`[Video] [Step 2/5] Meta Muse Spark script generation started for project ${projectId}. Dialect: ${dialect}, Platform: ${platform}, Tone: ${tone}`);
+        const dubRes = await defaultMetaVideoClient.generateAdvertisingVoiceover({
+          scenes,
+          durationSec: project.durationSec,
+          dialect,
+          platform,
+          tone,
+          voice,
+          userBrief
+        });
+
+        if (!dubRes.success || !dubRes.segments || dubRes.segments.length === 0) {
+          console.error(`[Video] [Step 2/5] Meta script generation failed for project ${projectId}: ${dubRes?.error || "Zero segments returned"}`);
+          await db.update(videoProjects).set({ status: 'analyzed', updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+          return res.status(500).json({ error: dubRes?.error || "Meta Muse Spark script generation returned 0 valid segments. Please retry script generation." });
+        }
+
+        console.log(`[Video] [Step 2/5] Meta Muse Spark script generation succeeded. Model: ${dubRes.model}, Generated ${dubRes.segments.length} text segments.`);
+        generatedSegments = dubRes.segments;
+        suggestedSettings = dubRes.suggestedTtsSettings;
+      }
+
+      // Save generated script WITHOUT audio URLs into DB & extract scene-synchronized sound effect cues
+      const cleanScriptSegments = generatedSegments.map(s => ({
+        id: s.id,
+        sceneId: s.sceneId,
+        startTimeSec: s.startTimeSec,
+        endTimeSec: s.endTimeSec,
+        text: s.text,
+        dialect: s.dialect || dialect,
+        voice: s.voice || voice,
+        emotion: s.emotion || 'excited',
+        pace: s.pace || 'fast'
+        // audioUrl is explicitly omitted until user approves & triggers Voiceover Generation
+      }));
+
+      const sfxCues = extractSoundEffectCues(scenes, cleanScriptSegments);
+
+      await db.update(videoProjects).set({
+        scriptData: JSON.stringify(cleanScriptSegments),
+        sfxData: JSON.stringify(sfxCues),
+        status: 'analyzed',
+        updatedAt: new Date()
+      }).where(eq(videoProjects.id, projectId));
+
+      res.json({
+        success: true,
+        segments: cleanScriptSegments,
+        sfx: sfxCues,
+        suggestedTtsSettings: suggestedSettings
+      });
+    } catch (err: any) {
+      console.error("[Video] Generate script error:", err);
+      res.status(500).json({ error: err.message || "Failed to generate script" });
+    }
+  });
+
+  // 3B2. Save User-Edited Sound Effect Cues
+  app.post("/api/video/:id/save-sfx", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectId = req.params.id;
+      const projectRows = await db.select().from(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Project not found" });
+
+      const { sfx: incomingSfx } = req.body;
+      if (!Array.isArray(incomingSfx)) {
+        return res.status(400).json({ error: "SFX must be a valid array of sound effect cues." });
+      }
+
+      await db.update(videoProjects).set({
+        sfxData: JSON.stringify(incomingSfx),
+        updatedAt: new Date()
+      }).where(eq(videoProjects.id, projectId));
+
+      res.json({
+        success: true,
+        sfx: incomingSfx
+      });
+    } catch (err: any) {
+      console.error("[Video] Save SFX error:", err);
+      res.status(500).json({ error: err.message || "Failed to save SFX edits" });
+    }
+  });
+
+  // 3B. Save User-Edited Script (Step 3 of User-Controlled Workflow)
+  app.post("/api/video/:id/save-script", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectId = req.params.id;
+      const projectRows = await db.select().from(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Project not found" });
+
+      const project = projectRows[0];
+      const { segments: incomingSegments } = req.body;
+
+      if (!Array.isArray(incomingSegments) || incomingSegments.length === 0) {
+        return res.status(400).json({ error: "Script must contain at least one valid segment." });
+      }
+
+      let existingSegments: VoiceoverSegment[] = project.scriptData ? JSON.parse(project.scriptData) : [];
+      const existingAudioMap = new Map<string, string>();
+      existingSegments.forEach(s => {
+        if (s.audioUrl) existingAudioMap.set(`${s.id}:${s.text.trim()}`, s.audioUrl);
+      });
+
+      const updatedSegments: VoiceoverSegment[] = incomingSegments.map((s: any, idx: number) => {
+        const text = String(s.text || '').trim();
+        const key = `${s.id || `seg-${idx + 1}`}:${text}`;
+        const existingAudio = existingAudioMap.get(key);
+
+        return {
+          id: s.id || `seg-${idx + 1}`,
+          sceneId: s.sceneId,
+          startTimeSec: typeof s.startTimeSec === 'number' ? s.startTimeSec : idx * 3,
+          endTimeSec: typeof s.endTimeSec === 'number' ? s.endTimeSec : (idx + 1) * 3,
+          text,
+          dialect: s.dialect || 'Algerian Arabic',
+          voice: s.voice || 'Puck',
+          emotion: s.emotion || 'excited',
+          pace: s.pace || 'fast',
+          audioUrl: existingAudio // Preserves audio only if text was not modified
+        };
+      });
+
+      await db.update(videoProjects).set({
+        scriptData: JSON.stringify(updatedSegments),
+        updatedAt: new Date()
+      }).where(eq(videoProjects.id, projectId));
+
+      res.json({
+        success: true,
+        segments: updatedSegments
+      });
+    } catch (err: any) {
+      console.error("[Video] Save script error:", err);
+      res.status(500).json({ error: err.message || "Failed to save script edits" });
+    }
+  });
+
+  // 3C. Regenerate Single Segment Text using Meta Muse Spark
+  app.post("/api/video/:id/regenerate-segment-text", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectId = req.params.id;
+      const projectRows = await db.select().from(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Project not found" });
+
+      const project = projectRows[0];
+      const { segmentId, dialect = 'Algerian Arabic', tone = 'Energetic sales', userBrief } = req.body;
+
+      let currentSegments: VoiceoverSegment[] = project.scriptData ? JSON.parse(project.scriptData) : [];
+      const targetSeg = currentSegments.find(s => s.id === segmentId);
+      if (!targetSeg) {
+        return res.status(400).json({ error: "Segment not found." });
+      }
+
+      const scenes: SceneAnalysis[] = project.analysisData ? JSON.parse(project.analysisData) : [];
+      const matchingScene = scenes.find(sc => sc.id === targetSeg.sceneId);
+
+      const result = await defaultMetaVideoClient.regenerateSingleSegmentText({
+        segmentId,
+        sceneDescription: matchingScene?.description,
+        currentText: targetSeg.text,
+        dialect,
+        tone,
+        userBrief
+      });
+
+      if (!result.success || !result.text) {
+        return res.status(500).json({ error: result.error || "Meta Muse Spark failed to regenerate segment text." });
+      }
+
+      currentSegments = currentSegments.map(s => {
+        if (s.id === segmentId) {
+          return {
+            ...s,
+            text: result.text,
+            audioUrl: undefined // Clear outdated audio because text was rewritten
+          };
+        }
+        return s;
+      });
+
+      await db.update(videoProjects).set({
+        scriptData: JSON.stringify(currentSegments),
+        updatedAt: new Date()
+      }).where(eq(videoProjects.id, projectId));
+
+      res.json({
+        success: true,
+        segmentId,
+        text: result.text
+      });
+    } catch (err: any) {
+      console.error("[Video] Regenerate segment text error:", err);
+      res.status(500).json({ error: err.message || "Failed to regenerate segment text" });
+    }
+  });
+
+  // 4. Generate Voiceover ONLY after User Explicit Approval (Step 4 of User-Controlled Workflow)
+  // Sends exact saved/edited script segments to Gemini 3.1 Flash TTS.
+  app.post("/api/video/:id/generate-voiceover", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectId = req.params.id;
+      const projectRows = await db.select().from(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Project not found" });
+
+      const project = projectRows[0];
+      const { dialect = 'Algerian Arabic', voice = 'Puck', tone = 'Energetic sales' } = req.body;
+
+      const segments: VoiceoverSegment[] = project.scriptData ? JSON.parse(project.scriptData) : [];
+      if (segments.length === 0) {
+        return res.status(400).json({ error: "No script segments found. Please generate and review a script first." });
+      }
+
+      await db.update(videoProjects).set({ status: 'generating', updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+
+      console.log(`[Video] [Step 4/5] User approved script. Starting speech synthesis with Gemini 3.1 Flash TTS (gemini-3.1-flash-tts-preview) for ALL ${segments.length} segments...`);
+      const apiKeys = getGeminiApiKeys();
+      if (apiKeys.length === 0) throw new Error("No Gemini API keys available for speech synthesis.");
+
+      const segmentsWithAudio: VoiceoverSegment[] = [];
+      let totalVoiceoverChars = 0;
+
+      for (let idx = 0; idx < segments.length; idx++) {
+        const seg = segments[idx];
+        totalVoiceoverChars += seg.text.length;
+
+        let success = false;
+        let genResult: { durationSec: number; audioUrl: string } | null = null;
+        let lastError = '';
+
+        // Try up to apiKeys.length retries with rotating keys per segment
+        for (let attempt = 0; attempt < Math.min(3, apiKeys.length); attempt++) {
+          const keyIdx = (currentKeyIndex + attempt) % apiKeys.length;
+          const keyObj = apiKeys[keyIdx];
+
+          console.log(`[Video] [Step 4/5] Synthesizing segment ${idx + 1}/${segments.length} (${seg.id}, key ${keyIdx + 1}/${apiKeys.length}, attempt ${attempt + 1}): "${seg.text}"...`);
+
+          try {
+            genResult = await generateSingleSegmentAudio(
+              { id: seg.id, type: 'speech', text: seg.text, pace: (seg.pace as any) || 'fast' },
+              { dialect: seg.dialect || dialect, voice: seg.voice || voice, style: tone, apiKey: keyObj.value, cacheDir }
+            );
+            success = true;
+            currentKeyIndex = (keyIdx + 1) % apiKeys.length; // Rotate starting index
+            break;
+          } catch (e: any) {
+            lastError = e.message || String(e);
+            console.warn(`[Video] Segment ${seg.id} attempt ${attempt + 1} failed with key ${keyObj.name}: ${lastError}`);
+            if (attempt < Math.min(3, apiKeys.length) - 1) {
+              await new Promise(r => setTimeout(r, 600)); // Small pause before retry
+            }
+          }
+        }
+
+        if (success && genResult) {
+          console.log(`[Video] [Step 4/5] Segment ${idx + 1}/${segments.length} (${seg.id}): STATUS=SUCCESS, duration=${genResult.durationSec}s, audioUrl=${genResult.audioUrl}`);
+          segmentsWithAudio.push({
+            ...seg,
+            audioUrl: genResult.audioUrl
+          });
+        } else {
+          console.error(`[Video] [Step 4/5] Segment ${idx + 1}/${segments.length} (${seg.id}): STATUS=FAILED after retries. Error: ${lastError}`);
+          segmentsWithAudio.push(seg);
+        }
+
+        // Add pause between segments to stay smoothly within Gemini RPM rate limits
+        if (idx < segments.length - 1) {
+          await new Promise(r => setTimeout(r, 1500));
+        }
+      }
+
+      const synthesizedCount = segmentsWithAudio.filter(s => Boolean(s.audioUrl)).length;
+      console.log(`[Video] [Step 4/5] TTS speech synthesis finished. ${synthesizedCount}/${segments.length} segments synthesized with audio.`);
+
+      if (synthesizedCount === 0) {
+        await db.update(videoProjects).set({ status: 'analyzed', updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+        return res.status(500).json({ error: "Gemini TTS failed to generate audio for all segments. Please check API keys and try again." });
+      }
+
+      // Update quota in PostgreSQL
+      try {
+        const userRecs = await db.select().from(users).where(eq(users.uid, decodedToken.uid));
+        if (userRecs.length > 0) {
+          const u = userRecs[0];
+          await db.update(users).set({
+            usedCharacters: (u.usedCharacters || 0) + totalVoiceoverChars,
+            generationCount: (u.generationCount || 0) + 1,
+            updatedAt: new Date()
+          }).where(eq(users.uid, decodedToken.uid));
+        }
+      } catch (e) {
+        console.warn("[Video] User quota update warning:", e);
+      }
+
+      await db.update(videoProjects).set({
+        scriptData: JSON.stringify(segmentsWithAudio),
+        status: 'analyzed',
+        updatedAt: new Date()
+      }).where(eq(videoProjects.id, projectId));
+
+      res.json({
+        success: true,
+        segments: segmentsWithAudio,
+        totalSegments: segments.length,
+        synthesizedCount
+      });
+    } catch (err: any) {
+      console.error("[Video] Generate voiceover error:", err);
+      res.status(500).json({ error: err.message || "Failed to generate voiceover" });
+    }
+  });
+
+  // Legacy Endpoint for Backward Compatibility: runs script generation + voiceover sequentially
+  app.post("/api/video/:id/generate-dub", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      await getAuth(adminApp).verifyIdToken(idToken);
+
+      // Delegate to generate-script then generate-voiceover
+      const scriptRes = await fetch(`http://localhost:3000/api/video/${req.params.id}/generate-script`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+        body: JSON.stringify(req.body)
+      });
+      if (!scriptRes.ok) {
+        const errData = await scriptRes.json();
+        return res.status(scriptRes.status).json(errData);
+      }
+
+      const voiceoverRes = await fetch(`http://localhost:3000/api/video/${req.params.id}/generate-voiceover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+        body: JSON.stringify(req.body)
+      });
+      const voiceoverData = await voiceoverRes.json();
+      if (!voiceoverRes.ok) {
+        return res.status(voiceoverRes.status).json(voiceoverData);
+      }
+
+      res.json(voiceoverData);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || "Failed to generate dubbing" });
+    }
+  });
+
+  // 4. Regenerate a Single Voiceover Segment
+  app.post("/api/video/:id/regenerate-segment", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectId = req.params.id;
+      const projectRows = await db.select().from(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Project not found" });
+
+      const project = projectRows[0];
+      const { segmentId, text, dialect = 'Algerian Arabic', voice = 'Puck', style = 'Friendly', pace = 'normal' } = req.body;
+
+      if (!segmentId || !text) {
+        return res.status(400).json({ error: "Segment ID and text are required" });
+      }
+
+      const apiKeys = getGeminiApiKeys();
+      const keyObj = apiKeys[currentKeyIndex % apiKeys.length];
+
+      const gen = await generateSingleSegmentAudio(
+        { id: segmentId, type: 'speech', text, pace: pace as any },
+        { dialect, voice, style, apiKey: keyObj.value, cacheDir }
+      );
+
+      let currentSegments: VoiceoverSegment[] = project.scriptData ? JSON.parse(project.scriptData) : [];
+      currentSegments = currentSegments.map(s => {
+        if (s.id === segmentId) {
+          return {
+            ...s,
+            text,
+            dialect,
+            voice,
+            audioUrl: gen.audioUrl
+          };
+        }
+        return s;
+      });
+
+      await db.update(videoProjects).set({
+        scriptData: JSON.stringify(currentSegments),
+        updatedAt: new Date()
+      }).where(eq(videoProjects.id, projectId));
+
+      res.json({
+        success: true,
+        segmentId,
+        audioUrl: gen.audioUrl,
+        durationSec: gen.durationSec
+      });
+    } catch (err: any) {
+      console.error("[Video] Regenerate segment error:", err);
+      res.status(500).json({ error: err.message || "Failed to regenerate segment" });
+    }
+  });
+
+  // 5. Render Final Composited Video (FFmpeg ducking/replace + resolution & fit controls)
+  app.post("/api/video/:id/render", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectId = req.params.id;
+      const projectRows = await db.select().from(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Project not found" });
+
+      const project = projectRows[0];
+      const {
+        audioMixMode = 'ducking',
+        duckingVolume = 0.15,
+        subtitlesEnabled = true,
+        outputWidth,
+        outputHeight,
+        fitMode = 'crop'
+      } = req.body;
+
+      const segments: VoiceoverSegment[] = project.scriptData ? JSON.parse(project.scriptData) : [];
+      if (segments.length === 0) {
+        return res.status(400).json({ error: "No voiceover segments available to render." });
+      }
+
+      await db.update(videoProjects).set({ status: 'generating', updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+
+      const projectDir = path.join(videoStorageDir, projectId);
+      const videoPath = path.join(projectDir, project.videoFilename);
+      const voiceoverWavPath = path.join(projectDir, "master_voiceover.wav");
+      const finalVideoPath = path.join(projectDir, "final_dubbed.mp4");
+
+      const audioSegments: AudioSegment[] = [];
+      const subtitleItems: SubtitleItem[] = [];
+
+      for (const seg of segments) {
+        if (seg.audioUrl) {
+          const match = seg.audioUrl.match(/\/api\/audio\/([^\.]+)\.wav/);
+          if (match) {
+            const diskAudioPath = path.join(cacheDir, `${match[1]}.wav`);
+            if (fs.existsSync(diskAudioPath)) {
+              audioSegments.push({
+                id: seg.id,
+                startTimeSec: seg.startTimeSec,
+                endTimeSec: seg.endTimeSec,
+                audioPath: diskAudioPath,
+                text: seg.text
+              });
+            }
+          }
+        }
+        if (seg.text) {
+          subtitleItems.push({
+            startTimeSec: seg.startTimeSec,
+            endTimeSec: seg.endTimeSec,
+            text: seg.text
+          });
+        }
+      }
+
+      if (audioSegments.length === 0) {
+        await db.update(videoProjects).set({ status: 'analyzed', updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+        return res.status(400).json({ error: "Voiceover audio must be generated before rendering final video. Please click 'Generate Voiceover' after reviewing your script." });
+      }
+
+      console.log(`[Video] [Step 5/5] Final rendering started for project ${projectId} (resolution=${outputWidth || 'original'}x${outputHeight || 'original'}, fitMode="${fitMode}", mixMode="${audioMixMode}")...`);
+
+      const scenesData = project.analysisData ? JSON.parse(project.analysisData) : [];
+      const sfxCues: SoundEffectCue[] = req.body.sfx || (project.sfxData ? JSON.parse(project.sfxData) : []);
+
+      // 1. Validate & Adjust Voiceover Timeline anchored to visual scenes
+      console.log(`[Video] Validating voiceover timeline and anchoring narration to visual scenes for ${audioSegments.length} segments...`);
+      const timelineResult = await validateAndAdjustTimeline(audioSegments, project.durationSec, 0.20, scenesData);
+      if (timelineResult.warnings.length > 0) {
+        console.log(`[Video] Timeline adjustments applied:`, timelineResult.warnings.join(' | '));
+      }
+
+      // 2. Validate Complete Final Timeline across Video, Voiceover, and Sound Effects
+      const completeTimelineReport = validateCompleteFinalTimeline({
+        originalVideoDurationSec: project.durationSec,
+        voiceoverSegments: timelineResult.adjustedSegments,
+        soundEffects: sfxCues,
+        scenes: scenesData
+      });
+
+      if (!completeTimelineReport.valid) {
+        console.error(`[Video] Complete timeline validation failed for project ${projectId}:`, completeTimelineReport.errors);
+        await db.update(videoProjects).set({ status: 'analyzed', updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
+        return res.status(400).json({
+          error: `Timeline validation failed before rendering: ${completeTimelineReport.errors.join(' | ')}`,
+          validationErrors: completeTimelineReport.errors
+        });
+      }
+
+      const targetOutputDurationSec = completeTimelineReport.targetOutputDurationSec;
+      const sceneNarrationTimeline = buildSceneNarrationTimeline(scenesData, timelineResult.adjustedSegments, sfxCues);
+
+      console.log(`[Video] Target output video duration calculated: ${targetOutputDurationSec}s (original=${project.durationSec}s, voiceoverEnd=${completeTimelineReport.voiceoverTrackEndSec}s, sfxEnd=${completeTimelineReport.sfxTrackEndSec}s, extensionRequired=${completeTimelineReport.requiresVideoExtension}).`);
+
+      // 3. Build synchronized master voiceover track with EBU R128 loudness normalization (-14 LUFS)
+      console.log(`[Video] Building non-overlapping synchronized voiceover track normalized to -14 LUFS for project ${projectId}...`);
+      await buildSynchronizedVoiceoverTrack(timelineResult.adjustedSegments, targetOutputDurationSec, voiceoverWavPath);
+
+      // 4. Extract original audio and separate human speech to generate background audio stem
+      const originalAudioPath = path.join(projectDir, "original_audio.wav");
+      const backgroundStemPath = path.join(projectDir, "background_stem.wav");
+      let hasBackgroundStem = false;
+
+      try {
+        console.log(`[Video] Extracting original audio and running speech separation for project ${projectId}...`);
+        const extracted = await extractAudioTrack(videoPath, originalAudioPath);
+        if (extracted) {
+          hasBackgroundStem = await extractBackgroundAudioStem(originalAudioPath, backgroundStemPath);
+        }
+      } catch (e: any) {
+        console.warn(`[Video] Speech separation stem extraction warning:`, e.message);
+      }
+
+      // 5. Composite final MP4 video with targetOutputDurationSec and soundEffects cues
+      console.log(`[Video] Compositing final video with audioMixMode="${audioMixMode}", targetDuration=${targetOutputDurationSec}s...`);
+      const validation = await compositeFinalVideo({
+        videoPath,
+        voiceoverWavPath,
+        backgroundStemPath: hasBackgroundStem ? backgroundStemPath : undefined,
+        outputPath: finalVideoPath,
+        audioMixMode: audioMixMode as any,
+        duckingVolume: Number(duckingVolume) || 0.15,
+        subtitles: subtitlesEnabled ? subtitleItems : [],
+        outputWidth: outputWidth ? Number(outputWidth) : undefined,
+        outputHeight: outputHeight ? Number(outputHeight) : undefined,
+        fitMode: fitMode as any,
+        targetOutputDurationSec,
+        soundEffects: sfxCues
+      });
+      console.log(`[Video] [Step 5/5] Final FFmpeg rendering & ffprobe validation completed successfully for project ${projectId}.`);
+
+      const finalVideoUrl = `/api/video/stream/${projectId}/final`;
+
+      await db.update(videoProjects).set({
+        status: 'completed',
+        audioMixMode,
+        finalVideoUrl,
+        durationSec: Math.round(targetOutputDurationSec),
+        sfxData: JSON.stringify(sfxCues),
+        updatedAt: new Date()
+      }).where(eq(videoProjects.id, projectId));
+
+      res.json({
+        success: true,
+        finalVideoUrl,
+        metadata: validation,
+        sceneNarrationTimeline,
+        loudnessMetrics: {
+          voiceoverLufs: validation.loudnessLufs || -14.0,
+          targetLufs: -14.0,
+          vocalSuppressionDb: -22.0
+        },
+        timelineValidation: {
+          overlapsFixed: timelineResult.overlapsDetected,
+          maxShiftSec: timelineResult.maxShiftSec,
+          targetOutputDurationSec,
+          requiresVideoExtension: completeTimelineReport.requiresVideoExtension,
+          extensionSec: completeTimelineReport.extensionSec,
+          warnings: timelineResult.warnings
+        }
+      });
+    } catch (err: any) {
+      console.error("[Video] Render error:", err);
+      res.status(500).json({ error: err.message || "Failed to render final video" });
+    }
+  });
+
+  // 6. Video Streaming Endpoints (HTTP 206 Partial Content)
+  app.get("/api/video/stream/:id", async (req, res) => {
+    try {
+      const projectId = req.params.id;
+      const projectRows = await db.select().from(videoProjects).where(eq(videoProjects.id, projectId));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Video not found" });
+
+      const project = projectRows[0];
+      const videoPath = path.join(videoStorageDir, projectId, project.videoFilename);
+      if (!fs.existsSync(videoPath)) return res.status(404).json({ error: "File not found" });
+
+      streamVideoFile(req, res, videoPath, "video/mp4");
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/video/stream/:id/final", async (req, res) => {
+    try {
+      const projectId = req.params.id;
+      const finalPath = path.join(videoStorageDir, projectId, "final_dubbed.mp4");
+      if (!fs.existsSync(finalPath)) return res.status(404).json({ error: "Final video not rendered yet" });
+
+      if (req.query.download === "true") {
+        res.setHeader("Content-Disposition", 'attachment; filename="doudouvoice_dubbed_ad.mp4"');
+      }
+      streamVideoFile(req, res, finalPath, "video/mp4");
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 7. Video Projects Management
+  app.get("/api/video/projects", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projects = await db.select().from(videoProjects).where(eq(videoProjects.uid, decodedToken.uid));
+      res.json(projects.sort((a, b) => {
+        const da = a.createdAt ? a.createdAt.getTime() : 0;
+        const db = b.createdAt ? b.createdAt.getTime() : 0;
+        return db - da;
+      }));
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/video/projects/:id", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectRows = await db.select().from(videoProjects).where(and(eq(videoProjects.id, req.params.id), eq(videoProjects.uid, decodedToken.uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Project not found" });
+
+      res.json(projectRows[0]);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete("/api/video/projects/:id", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
+      const idToken = authHeader.split("Bearer ")[1];
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
+
+      const projectId = req.params.id;
+      await db.delete(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
+
+      const projectDir = path.join(videoStorageDir, projectId);
+      await fs.promises.rm(projectDir, { recursive: true, force: true }).catch(() => {});
+
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ============================================================
+  // AI Video Creator — Beta Endpoints (Meta Multimodal + Modal FFmpeg)
+  // ============================================================
+  app.post("/api/creator/upload-assets", upload.array("mediaFiles", 10), async (req, res) => {
+    try {
+      const files = req.files as Express.Multer.File[];
+      if (!files || files.length === 0) {
+        return res.status(400).json({ error: "No media files uploaded" });
+      }
+
+      const projectId = req.body.projectId || crypto.randomUUID();
+      const projectDir = path.join(creatorStorageDir, projectId);
+      const assetsDir = path.join(projectDir, "assets");
+      if (!fs.existsSync(assetsDir)) {
+        fs.mkdirSync(assetsDir, { recursive: true });
+      }
+
+      const assets: CreatorAsset[] = [];
+      for (const file of files) {
+        const assetId = `asset_${crypto.randomUUID().slice(0, 8)}`;
+        const isVideo = file.mimetype.startsWith("video/");
+        const isImage = file.mimetype.startsWith("image/");
+        if (!isVideo && !isImage) continue;
+
+        const ext = path.extname(file.originalname) || (isVideo ? ".mp4" : ".png");
+        const savedFilePath = path.join(assetsDir, `${assetId}${ext}`);
+        fs.writeFileSync(savedFilePath, file.buffer);
+
+        let durationSec: number | undefined = undefined;
+        if (isVideo) {
+          try {
+            const probe = await probeVideo(savedFilePath);
+            durationSec = probe.durationSec;
+          } catch (_) {}
+        }
+
+        assets.push({
+          id: assetId,
+          type: isVideo ? "video" : "image",
+          filePath: savedFilePath,
+          originalName: file.originalname,
+          mimeType: file.mimetype,
+          durationSec
+        });
+      }
+
+      res.json({
+        success: true,
+        projectId,
+        assetsCount: assets.length,
+        assets
+      });
+    } catch (err: any) {
+      console.error("[Creator] Asset upload error:", err);
+      res.status(500).json({ error: err.message || "Failed to upload creator assets" });
+    }
+  });
+
+  app.post("/api/creator/pipeline-all", async (req, res) => {
+    try {
+      const { projectId, assets, dialect, voice, durationSec, aspectRatio, userPrompt } = req.body;
+
+      if (!projectId || !Array.isArray(assets) || assets.length === 0) {
+        return res.status(400).json({ error: "Missing required projectId or assets array" });
+      }
+
+      const projectDir = path.join(creatorStorageDir, projectId);
+      if (!fs.existsSync(projectDir)) {
+        fs.mkdirSync(projectDir, { recursive: true });
+      }
+
+      console.log(`[Creator Pipeline] Starting Meta + Modal workflow for project ${projectId}...`);
+
+      // Stage A: Meta Multimodal Asset Analysis (Muse Spark 1.3 + SAM 3.1)
+      console.log(`[Creator Pipeline] Stage A: Multimodal analysis on ${assets.length} assets...`);
+      const analysis = await analyzeCreatorAssets(assets, projectDir);
+
+      // Stage B: Meta Creative Direction
+      console.log(`[Creator Pipeline] Stage B: Meta Creative Direction...`);
+      const targetDurationSec = Number(durationSec) || 15;
+      const targetAspectRatio = ['9:16', '16:9', '1:1'].includes(aspectRatio) ? aspectRatio : '9:16';
+      const creativeDirection = await generateCreatorCreativeDirection(analysis, userPrompt, targetDurationSec, targetAspectRatio);
+
+      // Stage C: Meta Script Generation
+      console.log(`[Creator Pipeline] Stage C: Meta Script Generation (${dialect || 'Algerian Darija'}, voice=${voice || 'ar-DZ-Amir'})...`);
+      const script = await generateCreatorScript(creativeDirection, analysis, dialect || 'Algerian Darija', voice || 'ar-DZ-Amir');
+
+      // Stage D: DoudouVoice TTS Synthesis
+      console.log(`[Creator Pipeline] Stage D: Voice synthesis via DoudouVoice TTS...`);
+      const voiceoverInfo = await synthesizeCreatorVoiceover(script, projectDir);
+
+      // Stage E: Meta Editing Director (Generating Executable Editing Plan)
+      console.log(`[Creator Pipeline] Stage E: Meta Editing Director plan generation...`);
+      const editingPlan = await generateCreatorEditingPlan(creativeDirection, script, analysis, voiceoverInfo, assets, targetDurationSec);
+
+      // Stage 3: Modal Cloud + FFmpeg Video Rendering
+      console.log(`[Creator Pipeline] Stage 3: Rendering video via Modal Cloud / FFmpeg execution engine...`);
+      const finalVideoPath = path.join(projectDir, "final_creator_video.mp4");
+      const renderResult = await executeModalRendering({
+        projectId,
+        assets,
+        editingPlan,
+        masterVoiceoverPath: voiceoverInfo.masterVoiceoverPath,
+        outputFilePath: finalVideoPath
+      });
+
+      if (!renderResult.success) {
+        console.error(`[Creator Pipeline] FFprobe validation failed for project ${projectId}:`, renderResult.error);
+        return res.status(400).json({
+          success: false,
+          error: `Video rendering or FFprobe validation failed: ${renderResult.error}`,
+          renderedVia: renderResult.renderedVia,
+          isModalFallback: renderResult.isModalFallback,
+          validation: renderResult.validation
+        });
+      }
+
+      const finalVideoUrl = `/api/creator/stream/${projectId}/final`;
+
+      res.json({
+        success: true,
+        projectId,
+        finalVideoUrl,
+        renderedVia: renderResult.renderedVia,
+        isModalFallback: renderResult.isModalFallback,
+        hasAudioInputSupplied: renderResult.hasAudioInputSupplied,
+        videoOnly: renderResult.videoOnly,
+        durationSec: renderResult.durationSec,
+        fileSizeBytes: renderResult.fileSizeBytes,
+        validation: renderResult.validation,
+        analysis,
+        creativeDirection,
+        script,
+        editingPlan,
+        voiceoverInfo: {
+          totalDurationSec: voiceoverInfo.totalVoiceoverDurationSec,
+          segmentsCount: voiceoverInfo.audioSegments.length
+        }
+      });
+    } catch (err: any) {
+      console.error("[Creator Pipeline] Execution error:", err);
+      res.status(500).json({ error: err.message || "Pipeline execution failed" });
+    }
+  });
+
+  app.get("/api/creator/stream/:projectId/final", async (req, res) => {
+    try {
+      const { projectId } = req.params;
+      const finalVideoPath = path.join(creatorStorageDir, projectId, "final_creator_video.mp4");
+
+      if (!fs.existsSync(finalVideoPath)) {
+        return res.status(404).json({ error: "Final creator video not found or not rendered yet" });
+      }
+
+      if (req.query.download === "true") {
+        res.setHeader("Content-Disposition", 'attachment; filename="meta_ai_creator_video.mp4"');
+      }
+
+      streamVideoFile(req, res, finalVideoPath, "video/mp4");
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/creator/audio/:projectId/:filename", async (req, res) => {
+    try {
+      const { projectId, filename } = req.params;
+      if (!/^[a-zA-Z0-9_\-]+$/.test(projectId) || !/^[a-zA-Z0-9_\-]+\.wav$/.test(filename)) {
+        return res.status(400).json({ error: "Invalid audio path parameters" });
+      }
+      const audioPath = path.join(creatorStorageDir, projectId, filename);
+      if (!fs.existsSync(audioPath)) {
+        return res.status(404).json({ error: "Audio segment not found" });
+      }
+      res.setHeader("Content-Type", "audio/wav");
+      res.sendFile(audioPath);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
   });
 

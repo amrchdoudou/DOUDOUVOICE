@@ -39,3 +39,22 @@ export const settings = pgTable('settings', {
   value: text('value').notNull(),
   updatedAt: timestamp('updated_at').defaultNow(),
 });
+
+export const videoProjects = pgTable('video_projects', {
+  id: text('id').primaryKey(),
+  uid: text('uid').notNull(),
+  title: text('title').notNull(),
+  videoFilename: text('video_filename').notNull(),
+  videoUrl: text('video_url').notNull(),
+  durationSec: integer('duration_sec').notNull().default(0),
+  status: text('status').notNull().default('uploaded'),
+  mode: text('mode').notNull().default('understand'),
+  analysisData: text('analysis_data'),
+  scriptData: text('script_data'),
+  sfxData: text('sfx_data'),
+  audioMixMode: text('audio_mix_mode').notNull().default('ducking'),
+  finalVideoUrl: text('final_video_url'),
+  errorMessage: text('error_message'),
+  createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});

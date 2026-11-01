@@ -1,0 +1,5 @@
+file '/app/applet/creator_storage/test_verification/prepared_scene_1.mp4'
+file '/app/applet/creator_storage/test_verification/prepared_scene_2.mp4'
+file '/app/applet/creator_storage/test_verification/prepared_scene_3.mp4'
+file '/app/applet/creator_storage/test_verification/prepared_scene_4.mp4'
+file '/app/applet/creator_storage/test_verification/prepared_scene_5.mp4'

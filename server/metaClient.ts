@@ -496,7 +496,7 @@ Generate the grounded advertising script now as pure JSON.`;
 
     try {
       // First Generation Pass
-      const response = await this.callChatCompletion(messages, 0.4);
+      const response = await this.callMetaChat(messages, 0.4);
       let content = response.choices?.[0]?.message?.content || '';
 
       if (response.usage) {
@@ -537,7 +537,7 @@ Generate the grounded advertising script now as pure JSON.`;
           }
         ];
 
-        const repairResponse = await this.callChatCompletion(repairMessages, 0.2);
+        const repairResponse = await this.callMetaChat(repairMessages, 0.2);
         if (repairResponse.usage) {
           totalPromptTokens += repairResponse.usage.prompt_tokens || 0;
           totalCompletionTokens += repairResponse.usage.completion_tokens || 0;
@@ -601,7 +601,7 @@ Generate the grounded advertising script now as pure JSON.`;
     }
   }
 
-  private async callChatCompletion(messages: Array<{ role: string; content: string }>, temperature = 0.4): Promise<any> {
+  public async callMetaChat(messages: Array<{ role: string; content: string }>, temperature = 0.4): Promise<any> {
     if (!this.apiKey) {
       return await this.callGeminiFallback(messages, temperature);
     }
@@ -656,7 +656,7 @@ Generate the grounded advertising script now as pure JSON.`;
     const promptText = otherMsgs.map(m => `[${m.role.toUpperCase()}]:\n${m.content}`).join('\n\n');
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.8-flash',
       contents: promptText,
       config: {
         systemInstruction: systemMsg,

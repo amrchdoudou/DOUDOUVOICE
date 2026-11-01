@@ -4,7 +4,7 @@ import { useAuth } from '../lib/AuthContext';
 import { useLanguage } from '../lib/LanguageContext';
 import { useTheme } from '../lib/ThemeContext';
 import { signInWithGoogle, logOut } from '../lib/firebase';
-import { LogOut, User, Globe, Menu, X, Mic, CreditCard, History, LayoutDashboard, Sun, Moon } from 'lucide-react';
+import { LogOut, User, Globe, Menu, X, Mic, CreditCard, History, LayoutDashboard, Sun, Moon, Video } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 export default function Navbar() {
@@ -32,6 +32,7 @@ export default function Navbar() {
 
   const menuItems = [
     { label: t('studio'), path: '/generator', icon: Mic },
+    { label: t('video_studio'), path: '/video-studio', icon: Video },
     { label: t('pricing'), path: '/pricing', icon: CreditCard },
     ...(user ? [{ label: t('history'), path: '/history', icon: History }] : []),
     ...(user?.email === 'abdelwadoudamirouche7@gmail.com' ? [{ label: t('dashboard'), path: '/dashboard', icon: LayoutDashboard }] : []),
@@ -61,6 +62,19 @@ export default function Navbar() {
             className={`transition-colors hover:text-white ${location.pathname === '/generator' ? 'text-white font-bold' : ''}`}
           >
             {t('studio')}
+          </Link>
+          <Link 
+            to="/video-studio" 
+            className={`transition-colors hover:text-white flex items-center gap-1.5 ${location.pathname === '/video-studio' ? 'text-brand-400 font-bold' : ''}`}
+          >
+            {t('video_studio')}
+          </Link>
+          <Link 
+            to="/creator" 
+            className={`transition-colors hover:text-white flex items-center gap-1.5 ${location.pathname === '/creator' ? 'text-brand-400 font-bold' : ''}`}
+          >
+            <span className="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 text-[9px] font-bold border border-purple-500/30">BETA</span>
+            AI Creator
           </Link>
           <Link 
             to="/pricing" 

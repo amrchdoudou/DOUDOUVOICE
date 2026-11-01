@@ -22,6 +22,8 @@ import PrivacyPage from './pages/PrivacyPage';
 import RefundPage from './pages/RefundPage';
 import KabyleTestPage from './pages/KabyleTestPage';
 import ExpressiveTtsTestPage from './pages/ExpressiveTtsTestPage';
+import VideoStudio from './pages/VideoStudio';
+import AiVideoCreatorPage from './pages/AiVideoCreatorPage';
 import { initMetaPixel } from './lib/MetaPixel';
 
 const paypalOptions = {
@@ -51,6 +53,8 @@ export default function App() {
                   <Routes>
                   <Route path="/" element={<LandingPage />} />
                   <Route path="/generator" element={<GeneratorPage />} />
+                  <Route path="/video-studio" element={<VideoStudio />} />
+                  <Route path="/creator" element={<AiVideoCreatorPage />} />
                   <Route path="/history" element={<HistoryPage />} />
                   <Route path="/pricing" element={<PricingPage />} />
                   <Route path="/profile" element={<ProfilePage />} />

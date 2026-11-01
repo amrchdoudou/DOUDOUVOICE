@@ -94,7 +94,8 @@ export async function generateSingleSegmentAudio(
   }
 ): Promise<{ rawPcm: Buffer; durationSec: number; audioUrl: string }> {
   const { dialect, voice, style, apiKey, apiKeys, cacheDir } = options;
-  const isEnglish = dialect === 'American English (US)' || dialect === 'British English (UK)' || dialect.toLowerCase().includes('english');
+  const safeDialect = dialect || 'Algerian Arabic';
+  const isEnglish = safeDialect === 'American English (US)' || safeDialect === 'British English (UK)' || safeDialect.toLowerCase().includes('english');
 
   const presentationInstruction = style === 'Presentation'
     ? 'Delivery Style: Presentation. Speak with confidence, clarity, and natural authority. Sound like a skilled presenter explaining a product or feature to an audience or judging panel, with an engaging opening, natural rhythm, comfortable pauses between important ideas, clear articulation of technical terms, and professional enthusiasm without excessive advertising.'

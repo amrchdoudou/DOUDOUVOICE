@@ -11,6 +11,7 @@ interface LanguageContextType {
 const translations = {
   en: {
     'studio': 'Studio',
+    'video_studio': 'Video Studio',
     'pricing': 'Pricing',
     'history': 'History',
     'dashboard': 'Dashboard',
@@ -200,6 +201,20 @@ const translations = {
     'open_in_studio_tooltip': 'Open in Studio',
     'edit_with_meta_tooltip': 'Edit & Regenerate with Meta AI',
 
+    // VIDEO STUDIO WORKFLOW
+    'generate_script': 'Generate Script (Meta AI)',
+    'generating_script_text': 'Writing advertising script with Meta Muse Spark...',
+    'generate_voiceover': 'Generate Voiceover (Gemini TTS)',
+    'generating_voiceover': 'Synthesizing speech with Gemini 3.1 Flash TTS...',
+    'render_video': 'Render Final Video (FFmpeg)',
+    'rendering_video': 'Compositing final MP4 video...',
+    'save_script': 'Save Script Edits',
+    'regenerate_segment_text': 'Rewrite Segment (Meta AI)',
+    'regenerate_segment_audio': 'Synthesize Audio (Gemini TTS)',
+    'script_approved_badge': 'Script Ready for Voiceover',
+    'audio_ready_badge': 'Voiceover Audio Synthesized',
+    'audio_pending_notice': 'Voiceover audio pending generation. Review your script below, then click "Generate Voiceover".',
+
     // STYLES
     'Premium commercial': 'Premium commercial',
     'Professional business': 'Professional business',
@@ -219,6 +234,7 @@ const translations = {
   },
   ar: {
     'studio': 'الاستوديو',
+    'video_studio': 'استوديو الفيديو',
     'pricing': 'الأسعار',
     'history': 'السجل',
     'dashboard': 'لوحة التحكم',
@@ -406,6 +422,20 @@ const translations = {
     'go_to_meta': 'Meta AI',
     'open_in_studio_tooltip': 'فتح في الاستوديو للتعديل والتوليد',
     'edit_with_meta_tooltip': 'تعديل وتوليد عبر Meta AI',
+
+    // VIDEO STUDIO WORKFLOW
+    'generate_script': 'توليد النص الإعلاني (Meta AI)',
+    'generating_script_text': 'جاري صياغة النص الإعلاني عبر Meta Muse Spark...',
+    'generate_voiceover': 'توليد التعليق الصوتي (Gemini TTS)',
+    'generating_voiceover': 'جاري توليد الصوت عبر Gemini 3.1 Flash TTS...',
+    'render_video': 'دمج وتصدير الفيديو النهائي (FFmpeg)',
+    'rendering_video': 'جاري دمج الفيديو وإصدار ملف MP4...',
+    'save_script': 'حفظ تعديلات النص',
+    'regenerate_segment_text': 'إعادة صياغة النص (Meta AI)',
+    'regenerate_segment_audio': 'توليد الصوت (Gemini TTS)',
+    'script_approved_badge': 'النص جاهز لتوليد الصوت',
+    'audio_ready_badge': 'تم توليد التعليق الصوتي',
+    'audio_pending_notice': 'التعليق الصوتي قيد الانتظار. راجع النص أدناه ثم اضغط "توليد التعليق الصوتي".',
 
     // STYLES
     'Premium commercial': 'إعلان تجاري ممتاز',
