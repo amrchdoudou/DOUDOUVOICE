@@ -80,6 +80,54 @@ export function hasScriptDirectives(text: string): boolean {
   return /\[(sentence|pace|pause|sound):\s*[^\]]+\]/i.test(text);
 }
 
+export const DIALECT_HINTS: Record<string, string> = {
+  'Saudi Arabic':
+    'Use Najdi/Hijazi Saudi pronunciation: soft "ق" as "g" in Najdi contexts, natural elongation on emphasis words, typical Gulf intonation rising at question endings.',
+  'Emirati Arabic (Dubai / UAE)':
+    'Use Emirati Gulf pronunciation: "ج" often softened toward "y" sound in casual speech, Gulf vowel lengthening, relaxed conversational rhythm typical of UAE speakers.',
+  'Omani Arabic':
+    'Use Omani pronunciation: distinct Gulf cadence, clear articulation of "ق" as a hard sound, slower deliberate pacing typical of Omani speech.',
+  'Kuwaiti Arabic':
+    'Use Kuwaiti pronunciation: "ج" pronounced closer to "y", fast-paced casual Gulf rhythm, characteristic Kuwaiti vowel shortening.',
+  'Qatari Arabic':
+    'Use Qatari Gulf pronunciation: soft consonants similar to Bahraini/Emirati register, moderate pacing, Gulf intonation patterns.',
+  'Bahraini Arabic':
+    'Use Bahraini pronunciation: Gulf coastal accent, softer consonant articulation, moderate-paced natural Gulf rhythm.',
+  'Egyptian Arabic':
+    'Use Egyptian pronunciation: "ج" as hard "g" (like in "go"), "ث" often becomes "س" or "ت", distinctive Cairene melodic intonation, natural colloquial rhythm.',
+  'Algerian Arabic':
+    'Use Algerian Darija: heavy French-influenced vocabulary tone, "ق" as "g" or glottal stop depending on word, fast colloquial rhythm, Maghrebi consonant clusters.',
+  'Algerian Kabyle (Taqbaylit)':
+    'Use authentic Algerian Kabyle (Taqbaylit) phonology: spirantized stops (b, t, d, k, g softened between vowels), clear pharyngeals (ḥ, ɛ), and distinct natural cadence.',
+  'Tunisian Arabic':
+    'Use Tunisian Darija: distinct Maghrebi vowel reduction, "ق" as glottal stop, rapid natural pacing, characteristic Tunisian melodic pattern.',
+  'Libyan Arabic':
+    'Use Libyan pronunciation: Maghrebi-Egyptian hybrid influence, "ق" often as hard "g", distinctive Libyan vowel elongation on stressed syllables.',
+  'Moroccan Arabic':
+    'Use Moroccan Darija: heavy vowel reduction (short/dropped vowels), fast clipped rhythm, distinct Maghrebi consonant pronunciation very different from Fusha.',
+  'Syrian Arabic':
+    'Use Syrian Levantine pronunciation: "ق" as glottal stop, soft melodic Levantine intonation, natural Damascene conversational rhythm.',
+  'Iraqi Arabic':
+    'Use Iraqi (Baghdadi/Mesopotamian) pronunciation: distinct "چ" (ch) sound not found in most other dialects, "ق" often pronounced as "g" in rural/Bedouin-influenced speech or retained as "q" in urban Baghdadi speech, characteristic Iraqi vowel melody and rhythm very different from Gulf or Levantine accents — do not confuse it with Gulf or Syrian pronunciation.',
+  'Palestinian Arabic':
+    'Use Palestinian Levantine pronunciation: regional variation between urban/rural registers, "ق" as glottal stop in urban speech, natural Levantine melodic pattern.',
+  'Neutral Middle Eastern Arabic':
+    'Use a neutral pan-Arab colloquial register understandable across regions — avoid strongly localized slang, keep pronunciation closer to widely-understood Levantine/Gulf middle ground, but still clearly NOT Modern Standard Arabic.'
+};
+
+export const KABYLE_REGION_HINTS: Record<string, string> = {
+  default:
+    'Use standard Taqbaylit pronunciation with balanced spirantization of dental and velar stops, clear pharyngeals (ḥ, ɛ), and authentic conversational cadence.',
+  tizi_ouzou:
+    'Greater Kabylia (Tizi Ouzou) accent: characteristic melodic intonation, pronounced spirantization of non-geminated stops (b, t, d, k, g), and local rhythmic flow.',
+  bejaia:
+    'Lesser Kabylia (Béjaïa / Soummam) accent: distinctive eastern Kabyle melodic cadence, specific vowel transitions, and natural Soummam valley phrasing.',
+  bouira:
+    'South-Western Kabylia (Bouira) accent: fluent transitional intonation with authentic regional phonetic softening.',
+  bba_setif:
+    'Southern/eastern highland Kabyle accent: firmer stop articulations with characteristic highland melodic cadence.'
+};
+
 let globalKeyRotator = 0;
 
 export async function generateSingleSegmentAudio(
@@ -88,18 +136,37 @@ export async function generateSingleSegmentAudio(
     dialect: string;
     voice: string;
     style?: string;
+    emotion?: string;
+    speed?: number;
+    pitch?: number;
+    kabyleRegion?: string;
     apiKey?: string;
     apiKeys?: { name: string; value: string }[];
     cacheDir: string;
   }
 ): Promise<{ rawPcm: Buffer; durationSec: number; audioUrl: string }> {
-  const { dialect, voice, style, apiKey, apiKeys, cacheDir } = options;
+  const { dialect, voice, style, emotion, speed = 1, pitch = 0, kabyleRegion, apiKey, apiKeys, cacheDir } = options;
   const safeDialect = dialect || 'Algerian Arabic';
   const isEnglish = safeDialect === 'American English (US)' || safeDialect === 'British English (UK)' || safeDialect.toLowerCase().includes('english');
+  const isKabyle = safeDialect === 'Algerian Kabyle (Taqbaylit)';
 
-  const presentationInstruction = style === 'Presentation'
+  const styleInstruction = style === 'Presentation'
     ? 'Delivery Style: Presentation. Speak with confidence, clarity, and natural authority. Sound like a skilled presenter explaining a product or feature to an audience or judging panel, with an engaging opening, natural rhythm, comfortable pauses between important ideas, clear articulation of technical terms, and professional enthusiasm without excessive advertising.'
+    : (style ? `Speak in a ${style} style${emotion ? ` with a ${emotion} tone` : ''}.` : '');
+
+  const pitchHint = pitch > 1
+    ? 'Voice pitch: Deliver with a slightly higher, lighter vocal tone.'
+    : pitch < -1
+    ? 'Voice pitch: Deliver with a slightly deeper, richer vocal resonance.'
     : '';
+
+  const segmentPace = 'pace' in segment ? (segment as any).pace : undefined;
+  const effectiveSpeed = typeof speed === 'number' && speed > 0 ? speed : (segmentPace === 'fast' ? 1.15 : segmentPace === 'slow' ? 0.85 : 1.0);
+  const paceInstruction = effectiveSpeed > 1.1
+    ? 'Delivery: Speak at a moderately brisk, energetic, commercial pace with clean, clear articulation — do not rush or slur words.'
+    : effectiveSpeed < 0.9
+    ? 'Delivery: Speak at a calm, relaxed, slightly unhurried pace — just a touch slower than normal for clear delivery. Keep pronunciation completely natural without stretching syllables.'
+    : 'Delivery: Speak at a natural, standard conversational pace.';
 
   const keys: { name: string; value: string }[] = [];
   if (apiKeys && apiKeys.length > 0) {
@@ -114,42 +181,43 @@ export async function generateSingleSegmentAudio(
 
   let prompt = '';
   if (segment.type === 'speech') {
-    if (isEnglish) {
+    if (isKabyle) {
+      const regionKey = (kabyleRegion && KABYLE_REGION_HINTS[kabyleRegion]) ? kabyleRegion : 'default';
+      const regionHint = KABYLE_REGION_HINTS[regionKey];
+
+      prompt = `You are a native Algerian Kabyle (Taqbaylit) speaker. Speak the following text in natural, spoken, conversational Kabyle like chatting with a friend or presenting a lively local ad, never in a stiff news-reader tone.
+Strictly DO NOT read this as Modern Standard Arabic, Algerian Arabic Darija, or French. Pronounce all authentic Kabyle phonemes accurately: pharyngeals (ḥ, ɛ), emphatics (ṭ, ḍ, ṣ, ẓ), and ɣ; spirantize stops; articulate "ǧ" and "č" distinctly; and respect geminated consonants.
+${regionHint}
+${styleInstruction}
+${paceInstruction}
+${pitchHint}
+
+<<<TEXT_TO_SPEAK_START>>>
+${segment.text}
+<<<TEXT_TO_SPEAK_END>>>`;
+    } else if (isEnglish) {
       const accent = dialect === 'British English (UK)'
         ? 'British English (UK / RP / Modern British) accent with clear diction and natural cadence'
         : 'crisp, engaging American English (US) accent with natural commercial cadence';
 
-      let paceInstruction = '';
-      if (segment.pace === 'fast') {
-        paceInstruction = 'Delivery: Speak at a moderately brisk, energetic, upbeat commercial pace — slightly faster than normal with clean, crisp, articulate pronunciation. Do not rush or slur words.';
-      } else if (segment.pace === 'slow') {
-        paceInstruction = 'Delivery: Speak at a calm, relaxed, slightly unhurried commercial voice-over pace — just a touch slower than normal for clarity and emphasis. Keep pronunciation completely natural without stretching syllables or dragging out words.';
-      } else {
-        paceInstruction = 'Delivery: Speak at a natural, standard conversational voice-over pace.';
-      }
-
       prompt = `You are a professional voice-over artist and native speaker of English.
 Speak with a natural, ${accent}.
-${presentationInstruction}
+${styleInstruction}
 ${paceInstruction}
+${pitchHint}
 
 <<<TEXT_TO_SPEAK_START>>>
 ${segment.text}
 <<<TEXT_TO_SPEAK_END>>>`;
     } else {
-      let paceInstruction = '';
-      if (segment.pace === 'fast') {
-        paceInstruction = 'Delivery: Speak at a moderately brisk, energetic, commercial pace — slightly faster than normal with clear, articulate pronunciation. Do not rush or slur words.';
-      } else if (segment.pace === 'slow') {
-        paceInstruction = 'Delivery: Speak at a calm, relaxed, slightly unhurried pace — just a touch slower than normal for clear delivery. Keep pronunciation completely natural without stretching syllables or dragging out words.';
-      } else {
-        paceInstruction = 'Delivery: Speak at a natural, standard conversational pace.';
-      }
+      const dialectHint = DIALECT_HINTS[safeDialect] || '';
 
-      prompt = `You are a native ${dialect} speaker.
-Please speak the following text in natural ${dialect}.
-${presentationInstruction}
+      prompt = `You are a native ${safeDialect} speaker.
+Please speak the following text in natural ${safeDialect}. DO NOT read it as Modern Standard Arabic (Fusha) under any circumstances. Adopt a strong, authentic native ${safeDialect} accent.
+${dialectHint}
+${styleInstruction}
 ${paceInstruction}
+${pitchHint}
 
 <<<TEXT_TO_SPEAK_START>>>
 ${segment.text}
@@ -232,13 +300,22 @@ ${segment.text}
         lastErr = err;
         const msg = (err.message || "").toLowerCase();
         if (
-          msg.includes("quota") ||
-          msg.includes("limit") ||
-          msg.includes("exhausted") ||
-          msg.includes("429") ||
-          err.status === 429
+          keys.length > 1 &&
+          (msg.includes("quota") ||
+            msg.includes("limit") ||
+            msg.includes("exhausted") ||
+            msg.includes("429") ||
+            msg.includes("403") ||
+            msg.includes("401") ||
+            msg.includes("permission") ||
+            msg.includes("forbidden") ||
+            msg.includes("leaked") ||
+            msg.includes("invalid") ||
+            err.status === 429 ||
+            err.status === 403 ||
+            err.status === 401)
         ) {
-          console.warn(`[Expressive TTS] Key ${keyObj.name} hit quota/limit on segment ${segment.id}, trying next key...`);
+          console.warn(`[Expressive TTS] Key ${keyObj.name} failed (${err.status || 'key error'}) on segment ${segment.id}, trying next key...`);
           continue;
         } else {
           throw err;

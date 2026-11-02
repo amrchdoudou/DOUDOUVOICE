@@ -57,6 +57,8 @@ export function getGeminiApiKeys(): KeyObject[] {
   return uniqueKeys;
 }
 
+const disabledKeyNames = new Set<string>();
+
 /**
  * Checks whether an error is specific to an API key / project quota / billing tier.
  */
@@ -68,6 +70,8 @@ export function isKeySpecificError(err: any): boolean {
     msg.includes('limit') ||
     msg.includes('exhausted') ||
     msg.includes('429') ||
+    msg.includes('403') ||
+    msg.includes('401') ||
     msg.includes('api key') ||
     msg.includes('apikey') ||
     msg.includes('key not') ||
@@ -77,6 +81,10 @@ export function isKeySpecificError(err: any): boolean {
     msg.includes('billing') ||
     msg.includes('free tier') ||
     msg.includes('permission_denied') ||
+    msg.includes('permission') ||
+    msg.includes('leaked') ||
+    msg.includes('suspended') ||
+    msg.includes('disabled') ||
     msg.includes('الحد الأقصى') ||
     msg.includes('سيرفرات الصوت') ||
     msg.includes('rate limit') ||
@@ -85,6 +93,30 @@ export function isKeySpecificError(err: any): boolean {
     err.status === 429 ||
     err.status === 401 ||
     err.status === 403
+  );
+}
+
+/**
+ * Checks whether a key error is a permanent credential/permission failure (401/403/invalid/leaked)
+ * or daily quota exhaustion (GenerateRequestsPerDay) rather than a transient per-minute rate limit.
+ */
+export function isPermanentKeyError(err: any): boolean {
+  if (!err) return false;
+  const msg = (err.message || String(err)).toLowerCase();
+  return (
+    err.status === 401 ||
+    err.status === 403 ||
+    msg.includes('403') ||
+    msg.includes('401') ||
+    msg.includes('permission_denied') ||
+    msg.includes('forbidden') ||
+    msg.includes('unauthorized') ||
+    msg.includes('leaked') ||
+    msg.includes('suspended') ||
+    msg.includes('api_key_invalid') ||
+    msg.includes('key not valid') ||
+    msg.includes('per day limit exceeded') ||
+    msg.includes('generaterequestsperday')
   );
 }
 
@@ -102,6 +134,7 @@ export interface ExpressiveVoiceSegment {
 /**
  * Synthesizes audio for a single segment with Studio-compatible multi-key rotation, retries, and expressive voice direction.
  * Tries the currently active key, and automatically switches to the next available key if an issue arises.
+ * Permanently invalid/403 keys are skipped on subsequent segments so they do not slow down multi-segment voiceover runs.
  * If all keys fail, throws the exact error. Never fabricates fake audio or silence.
  */
 export async function synthesizeSegmentWithStudioFallback(
@@ -110,15 +143,27 @@ export async function synthesizeSegmentWithStudioFallback(
     dialect: string;
     voice: string;
     style?: string;
+    emotion?: string;
+    gender?: 'male' | 'female';
+    speed?: number;
+    pitch?: number;
+    kabyleRegion?: string;
     cacheDir?: string;
   }
 ): Promise<{ rawPcm: Buffer; durationSec: number; audioUrl: string; audioPath?: string }> {
-  const apiKeys = getGeminiApiKeys();
-  if (apiKeys.length === 0) {
+  const allApiKeys = getGeminiApiKeys();
+  if (allApiKeys.length === 0) {
     throw new Error('No Gemini API keys configured in environment/secrets (GEMINI_API_KEY or gemini_api_key1).');
   }
 
-  const { dialect, voice, style } = options;
+  // Filter out keys known to be permanently invalid/403, unless all keys were marked disabled
+  let apiKeys = allApiKeys.filter(k => !disabledKeyNames.has(k.name));
+  if (apiKeys.length === 0) {
+    disabledKeyNames.clear();
+    apiKeys = allApiKeys;
+  }
+
+  const { dialect, voice, style, emotion, speed, pitch, kabyleRegion } = options;
   const cacheDir = options.cacheDir || path.join(process.cwd(), 'audio_cache');
   if (!fs.existsSync(cacheDir)) {
     fs.mkdirSync(cacheDir, { recursive: true });
@@ -136,8 +181,9 @@ export async function synthesizeSegmentWithStudioFallback(
     warm: 'Warm, welcoming delivery with comfortable natural micro-pauses'
   };
 
-  const emotionInstruction = segment.emotion && emotionMap[segment.emotion]
-    ? emotionMap[segment.emotion]
+  const chosenEmotion = segment.emotion || emotion;
+  const emotionInstruction = chosenEmotion && emotionMap[chosenEmotion]
+    ? emotionMap[chosenEmotion]
     : (style || 'Premium commercial with natural expressive inflection');
 
   const fullStyle = segment.deliveryInstruction
@@ -151,7 +197,7 @@ export async function synthesizeSegmentWithStudioFallback(
     const keyIdx = (startIdx + attempt) % apiKeys.length;
     const keyObj = apiKeys[keyIdx];
 
-    console.log(`[TTS Engine] Generating segment ${segment.id} (${segment.emotion || 'standard'}) with key "${keyObj.name}" (attempt ${attempt + 1}/${apiKeys.length})...`);
+    console.log(`[TTS Engine] Generating segment ${segment.id} (${chosenEmotion || 'standard'}) with key "${keyObj.name}" (attempt ${attempt + 1}/${apiKeys.length})...`);
 
     try {
       const segmentType = segment.type || 'speech';
@@ -167,6 +213,10 @@ export async function synthesizeSegmentWithStudioFallback(
           dialect,
           voice,
           style: fullStyle,
+          emotion: chosenEmotion,
+          speed,
+          pitch,
+          kabyleRegion,
           apiKey: keyObj.value,
           cacheDir
         }
@@ -181,7 +231,12 @@ export async function synthesizeSegmentWithStudioFallback(
     } catch (err: any) {
       lastError = err;
       const isRecoverable = isKeySpecificError(err);
-      console.warn(`[TTS Engine] Key "${keyObj.name}" failed for segment ${segment.id}: ${err.message || err}`);
+      if (isPermanentKeyError(err) && allApiKeys.length > 1) {
+        disabledKeyNames.add(keyObj.name);
+        console.warn(`[TTS Engine] Key "${keyObj.name}" returned permanent auth/permission error (401/403); marking disabled for session.`);
+      } else {
+        console.warn(`[TTS Engine] Key "${keyObj.name}" failed for segment ${segment.id}: ${err.message || err}`);
+      }
 
       if (isRecoverable && attempt < apiKeys.length - 1) {
         console.warn(`[TTS Engine] Switching to next available key in rotation pool...`);

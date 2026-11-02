@@ -8,8 +8,8 @@ import { initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import firebaseConfig from "./firebase-applet-config.json";
 import { db } from "./src/db/index.js";
-import { users, pendingOrders, history, settings, videoProjects } from "./src/db/schema.js";
-import { eq, and } from "drizzle-orm";
+import { users, pendingOrders, history, settings, videoProjects, creatorProjects } from "./src/db/schema.js";
+import { eq, and, desc } from "drizzle-orm";
 import { normalizeKabyle, VALID_KABYLE_REGIONS, KABYLE_REGIONS } from "./src/lib/kabyle.js";
 import { defaultMetaClient } from "./server/metaClient.js";
 import { processAndComposeScript, generateSingleSegmentAudio, hasScriptDirectives } from "./server/expressiveTts.js";
@@ -38,22 +38,290 @@ import {
   generateCreatorScript,
   synthesizeCreatorVoiceover,
   generateCreatorEditingPlan,
-  CreatorAsset
+  runIterativeEditingPlanReviewLoop,
+  reconcileLockedEditingPlanWithSynthesizedVoiceover,
+  inspectRenderedVideoWithMuseSpark11,
+  repairEditingPlanFromInspection,
+  CreatorAsset,
+  mapCreatorVoiceToGemini,
+  FinalVideoInspectionReport
 } from "./server/metaCreatorService.js";
-import { executeModalRendering } from "./server/modalRunner.js";
+import {
+  getMetaContributorModel,
+  getMetaReviewerModel,
+  getMetaInspectorModel
+} from "./server/metaConfig.js";
+import { synthesizeSegmentWithStudioFallback } from "./server/ttsKeyRotation.js";
+import { executeModalRendering, ensureQuickTimeCompatibleMp4, ModalRenderingResult } from "./server/modalRunner.js";
 
-const creatorStorageDir = path.join(process.cwd(), "creator_storage");
+const FALLBACK_RUNTIME_STREAM_SECRET = crypto
+  .createHmac("sha256", "doudouvoice-stream-token-key")
+  .update(
+    process.env.SQL_PASSWORD ||
+      process.env.META_API_KEY ||
+      process.env.GEMINI_API_KEY ||
+      firebaseConfig.projectId ||
+      "doudouvoice-default-stream-secret"
+  )
+  .digest("hex");
+
+function getStreamTokenSecret(): string {
+  if (process.env.STREAM_TOKEN_SECRET && process.env.STREAM_TOKEN_SECRET.trim() !== "") {
+    return process.env.STREAM_TOKEN_SECRET;
+  }
+  return FALLBACK_RUNTIME_STREAM_SECRET;
+}
+
+export class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export function createHttpError(status: number, message: string): HttpError {
+  return new HttpError(status, message);
+}
+
+export function sendHttpError(res: express.Response, err: any, fallbackMessage = "Request failed") {
+  const status = typeof err?.status === "number" && err.status >= 400 && err.status < 600 ? err.status : 500;
+  const safeMessage = err instanceof HttpError
+    ? err.message
+    : status < 500 && typeof err?.message === "string"
+      ? err.message
+      : fallbackMessage;
+  if (status >= 500) {
+    console.error("[Server Error]", err?.message || err);
+  }
+  return res.status(status).json({ error: safeMessage });
+}
+
+export const creatorStorageDir = path.join(process.cwd(), "creator_storage");
 if (!fs.existsSync(creatorStorageDir)) {
   fs.mkdirSync(creatorStorageDir, { recursive: true });
 }
 
-const upload = multer({ storage: multer.memoryStorage() });
+const ALLOWED_CREATOR_MIMETYPES = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "video/x-m4v"
+]);
+
+const ALLOWED_CREATOR_EXTENSIONS = new Set([
+  ".jpg",
+  ".jpeg",
+  ".png",
+  ".webp",
+  ".mp4",
+  ".webm",
+  ".mov",
+  ".m4v"
+]);
+
+function isAllowedCreatorFile(file: Express.Multer.File): boolean {
+  const mime = (file.mimetype || "").toLowerCase();
+  if (ALLOWED_CREATOR_MIMETYPES.has(mime)) return true;
+  const ext = path.extname(file.originalname || "").toLowerCase();
+  if ((mime === "application/octet-stream" || mime === "") && ALLOWED_CREATOR_EXTENSIONS.has(ext)) {
+    return true;
+  }
+  return false;
+}
+
+const creatorUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB per file
+    files: 10                   // max 10 files
+  },
+  fileFilter: (_req, file, cb) => {
+    if (isAllowedCreatorFile(file)) {
+      cb(null, true);
+    } else {
+      cb(createHttpError(400, `Unsupported file type: ${file.mimetype}. Allowed: JPEG, PNG, WebP, MP4, MOV, WebM.`));
+    }
+  }
+});
+
+const creatorChunkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 16 * 1024 * 1024, // 16MB max per chunk (well under Cloud Run 32MB limit)
+    files: 1
+  }
+});
 
 console.log("[DEBUG] projectId:", firebaseConfig.projectId);
 
 const adminApp = initializeApp({
   projectId: firebaseConfig.projectId,
 });
+
+type VerifyIdTokenFn = (token: string) => Promise<{ uid: string; email?: string; [key: string]: any }>;
+let customVerifyIdToken: VerifyIdTokenFn | null = null;
+
+export function setVerifyIdTokenForTests(fn: VerifyIdTokenFn | null) {
+  customVerifyIdToken = fn;
+}
+
+export async function requireUser(req: express.Request): Promise<{ uid: string; email?: string; [key: string]: any }> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    throw createHttpError(401, "Missing or invalid Authorization header.");
+  }
+  const idToken = authHeader.slice("Bearer ".length).trim();
+  if (!idToken) {
+    throw createHttpError(401, "Missing authentication token.");
+  }
+  try {
+    const decoded = customVerifyIdToken
+      ? await customVerifyIdToken(idToken)
+      : await getAuth(adminApp).verifyIdToken(idToken);
+    if (!decoded || typeof decoded.uid !== "string" || !decoded.uid) {
+      throw createHttpError(401, "Invalid authentication token.");
+    }
+    return decoded;
+  } catch (err: any) {
+    if (err instanceof HttpError) throw err;
+    throw createHttpError(401, "Authentication failed.");
+  }
+}
+
+export function safeProjectId(v: unknown): string {
+  if (typeof v !== "string" || !/^[a-zA-Z0-9_-]{8,64}$/.test(v)) {
+    throw createHttpError(400, "Invalid projectId format.");
+  }
+  return v;
+}
+
+export function createStreamToken(projectId: string, uid: string, ttlSeconds = 600): { token: string; exp: number } {
+  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const payloadB64 = Buffer.from(JSON.stringify({ projectId, uid, exp }), "utf-8").toString("base64url");
+  const sig = crypto
+    .createHmac("sha256", getStreamTokenSecret())
+    .update(payloadB64)
+    .digest("base64url");
+  return { token: `${payloadB64}.${sig}`, exp };
+}
+
+export function verifyStreamToken(token: unknown, expectedProjectId: string): { projectId: string; uid: string; exp: number } {
+  if (typeof token !== "string" || !token.includes(".")) {
+    throw createHttpError(401, "Missing or malformed stream token.");
+  }
+  const parts = token.split(".");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw createHttpError(401, "Malformed stream token.");
+  }
+  const [payloadB64, sig] = parts;
+  const expectedSig = crypto
+    .createHmac("sha256", getStreamTokenSecret())
+    .update(payloadB64)
+    .digest("base64url");
+
+  const sigBuf = Buffer.from(sig, "utf-8");
+  const expectedBuf = Buffer.from(expectedSig, "utf-8");
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    throw createHttpError(401, "Invalid stream token signature.");
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf-8"));
+  } catch (_) {
+    throw createHttpError(401, "Invalid stream token payload.");
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (typeof payload?.exp !== "number" || payload.exp <= nowSec) {
+    throw createHttpError(401, "Stream token has expired.");
+  }
+  if (payload?.projectId !== expectedProjectId || typeof payload?.uid !== "string" || !payload.uid) {
+    throw createHttpError(401, "Stream token project mismatch.");
+  }
+
+  return {
+    projectId: payload.projectId,
+    uid: payload.uid,
+    exp: payload.exp
+  };
+}
+
+function hasAuthOrStreamToken(req: express.Request): boolean {
+  const qToken = req.query?.t;
+  const authHeader = req.headers.authorization;
+  return (typeof qToken === "string" && qToken.length > 0) || Boolean(authHeader && authHeader.startsWith("Bearer "));
+}
+
+async function resolveStreamUserUid(req: express.Request, projectId: string): Promise<string> {
+  if (typeof req.query?.t === "string" && req.query.t.length > 0) {
+    const verified = verifyStreamToken(req.query.t, projectId);
+    return verified.uid;
+  }
+  const decoded = await requireUser(req);
+  return decoded.uid;
+}
+
+interface CreatorRateState {
+  activeCount: number;
+  activeProjectId?: string;
+  timestamps: number[];
+}
+
+const creatorRateLimits = new Map<string, CreatorRateState>();
+const activeInMemoryJobIds = new Set<string>();
+const CREATOR_MAX_RUNS_PER_HOUR = 5;
+const CREATOR_MAX_CONCURRENT = 1;
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
+export function resetCreatorRateLimitsForTests() {
+  creatorRateLimits.clear();
+  activeInMemoryJobIds.clear();
+}
+
+function acquireCreatorPipelineSlot(uid: string, projectId?: string): () => void {
+  const now = Date.now();
+  const state = creatorRateLimits.get(uid) || { activeCount: 0, timestamps: [] };
+  state.timestamps = state.timestamps.filter(ts => now - ts < ONE_HOUR_MS);
+
+  // Self-heal if activeCount > 0 but the tracked activeProjectId is no longer in activeInMemoryJobIds
+  if (state.activeCount > 0 && state.activeProjectId && !activeInMemoryJobIds.has(state.activeProjectId)) {
+    state.activeCount = 0;
+    state.activeProjectId = undefined;
+  }
+
+  if (state.activeCount >= CREATOR_MAX_CONCURRENT) {
+    throw createHttpError(429, "Rate limit exceeded: only 1 concurrent pipeline run is allowed per user.");
+  }
+  if (state.timestamps.length >= CREATOR_MAX_RUNS_PER_HOUR) {
+    throw createHttpError(429, "Rate limit exceeded: maximum 5 pipeline runs per hour.");
+  }
+
+  state.activeCount += 1;
+  if (projectId) {
+    state.activeProjectId = projectId;
+  }
+  state.timestamps.push(now);
+  creatorRateLimits.set(uid, state);
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const current = creatorRateLimits.get(uid);
+    if (current) {
+      current.activeCount = Math.max(0, current.activeCount - 1);
+      if (!projectId || current.activeProjectId === projectId) {
+        current.activeProjectId = undefined;
+      }
+    }
+  };
+}
 
 async function loadLocalPayPalSettings() {
   try {
@@ -309,9 +577,8 @@ ${text}
 <<<TEXT_TO_SPEAK_END>>>`;
 }
 
-async function startServer() {
+export async function createApp(options?: { skipVite?: boolean }) {
   const app = express();
-  const PORT = 3000;
 
   app.use(express.json({ limit: '100mb' }));
   app.use(express.urlencoded({ extended: true, limit: '100mb' }));
@@ -621,16 +888,7 @@ async function startServer() {
   // AI Advertising Scriptwriter Endpoint (Meta Model API with Grounding Verification)
   app.post("/api/scriptwriter/generate", async (req, res) => {
     try {
-      const authHeader = req.headers.authorization;
-      if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        return res.status(401).json({ error: "Missing or invalid Authorization header. Please log in again." });
-      }
-      const idToken = authHeader.split("Bearer ")[1];
-      try {
-        await getAuth(adminApp).verifyIdToken(idToken);
-      } catch (err: any) {
-        return res.status(401).json({ error: `Authentication failed: ${err.message}` });
-      }
+      await requireUser(req);
 
       const { facts, dialect, platform, tone, duration, targetAudience, restrictions, image } = req.body;
 
@@ -656,13 +914,16 @@ async function startServer() {
       });
 
       if (!result.success) {
-        return res.status(500).json({ error: result.error || "Failed to generate advertising script." });
+        return res.status(503).json({
+          error: result.error || "Failed to generate advertising script.",
+          provider: result.provider,
+          model: result.model
+        });
       }
 
       res.json(result);
     } catch (error: any) {
-      console.error("Error in /api/scriptwriter/generate:", error);
-      res.status(500).json({ error: error.message || "An unexpected error occurred during script generation." });
+      sendHttpError(res, error, "An unexpected error occurred during script generation.");
     }
   });
 
@@ -902,6 +1163,8 @@ async function startServer() {
 
       res.json({
         success: true,
+        provider: analysisResult.provider || 'meta',
+        model: analysisResult.model,
         summary: analysisResult.summary,
         detectedVisualTags: analysisResult.detectedVisualTags,
         scenes: analysisResult.scenes,
@@ -945,6 +1208,8 @@ async function startServer() {
 
       let generatedSegments: VoiceoverSegment[] = [];
       let suggestedSettings = { style: tone, emotion: 'excited', pace: 'energetic' };
+      let usedProvider: string = 'meta';
+      let usedModel: string = '';
 
       if (mode === 'localize') {
         const projectDir = path.join(videoStorageDir, projectId);
@@ -963,8 +1228,10 @@ async function startServer() {
           return res.status(500).json({ error: locRes.error || "Audio localization returned no script segments." });
         }
         generatedSegments = locRes.localizedSegments;
+        usedProvider = locRes.provider || 'gemini-fallback';
+        usedModel = locRes.model || '';
       } else {
-        console.log(`[Video] [Step 2/5] Meta Muse Spark script generation started for project ${projectId}. Dialect: ${dialect}, Platform: ${platform}, Tone: ${tone}`);
+        console.log(`[Video] [Step 2/5] Script generation started for project ${projectId}. Dialect: ${dialect}, Platform: ${platform}, Tone: ${tone}`);
         const dubRes = await defaultMetaVideoClient.generateAdvertisingVoiceover({
           scenes,
           durationSec: project.durationSec,
@@ -976,14 +1243,16 @@ async function startServer() {
         });
 
         if (!dubRes.success || !dubRes.segments || dubRes.segments.length === 0) {
-          console.error(`[Video] [Step 2/5] Meta script generation failed for project ${projectId}: ${dubRes?.error || "Zero segments returned"}`);
+          console.error(`[Video] [Step 2/5] Script generation failed for project ${projectId}: ${dubRes?.error || "Zero segments returned"}`);
           await db.update(videoProjects).set({ status: 'analyzed', updatedAt: new Date() }).where(eq(videoProjects.id, projectId));
-          return res.status(500).json({ error: dubRes?.error || "Meta Muse Spark script generation returned 0 valid segments. Please retry script generation." });
+          return res.status(500).json({ error: dubRes?.error || "Script generation returned 0 valid segments. Please retry script generation." });
         }
 
-        console.log(`[Video] [Step 2/5] Meta Muse Spark script generation succeeded. Model: ${dubRes.model}, Generated ${dubRes.segments.length} text segments.`);
+        console.log(`[Video] [Step 2/5] Script generation succeeded. Provider: ${dubRes.provider}, Model: ${dubRes.model}, Generated ${dubRes.segments.length} text segments.`);
         generatedSegments = dubRes.segments;
         suggestedSettings = dubRes.suggestedTtsSettings;
+        usedProvider = dubRes.provider || 'meta';
+        usedModel = dubRes.model;
       }
 
       // Save generated script WITHOUT audio URLs into DB & extract scene-synchronized sound effect cues
@@ -1011,6 +1280,8 @@ async function startServer() {
 
       res.json({
         success: true,
+        provider: usedProvider,
+        model: usedModel,
         segments: cleanScriptSegments,
         sfx: sfxCues,
         suggestedTtsSettings: suggestedSettings
@@ -1167,6 +1438,8 @@ async function startServer() {
 
       res.json({
         success: true,
+        provider: result.provider || 'meta',
+        model: result.model,
         segmentId,
         text: result.text
       });
@@ -1563,11 +1836,50 @@ async function startServer() {
     }
   });
 
-  // 6. Video Streaming Endpoints (HTTP 206 Partial Content)
+  // 6. Video Streaming Token & Streaming Endpoints (HTTP 206 Partial Content)
+  const handleIssueStreamToken = async (req: express.Request, res: express.Response) => {
+    try {
+      const decoded = await requireUser(req);
+      const projectId = safeProjectId(req.params.id);
+
+      const videoRows = await db
+        .select()
+        .from(videoProjects)
+        .where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decoded.uid)));
+
+      const creatorRows = videoRows.length === 0
+        ? await db
+            .select()
+            .from(creatorProjects)
+            .where(and(eq(creatorProjects.id, projectId), eq(creatorProjects.uid, decoded.uid)))
+        : [];
+
+      if (videoRows.length === 0 && creatorRows.length === 0) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+
+      const { token, exp } = createStreamToken(projectId, decoded.uid, 600);
+      res.json({ success: true, projectId, token, exp });
+    } catch (err: any) {
+      sendHttpError(res, err, "Failed to issue stream token");
+    }
+  };
+
+  app.post("/api/video/:id/stream-token", handleIssueStreamToken);
+  app.post("/api/creator/:id/stream-token", handleIssueStreamToken);
+
   app.get("/api/video/stream/:id", async (req, res) => {
     try {
-      const projectId = req.params.id;
-      const projectRows = await db.select().from(videoProjects).where(eq(videoProjects.id, projectId));
+      if (!hasAuthOrStreamToken(req)) {
+        throw createHttpError(401, "Authentication or stream token required.");
+      }
+      const projectId = safeProjectId(req.params.id);
+      const uid = await resolveStreamUserUid(req, projectId);
+
+      const projectRows = await db
+        .select()
+        .from(videoProjects)
+        .where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, uid)));
       if (projectRows.length === 0) return res.status(404).json({ error: "Video not found" });
 
       const project = projectRows[0];
@@ -1576,13 +1888,24 @@ async function startServer() {
 
       streamVideoFile(req, res, videoPath, "video/mp4");
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendHttpError(res, err, "Failed to stream video");
     }
   });
 
   app.get("/api/video/stream/:id/final", async (req, res) => {
     try {
-      const projectId = req.params.id;
+      if (!hasAuthOrStreamToken(req)) {
+        throw createHttpError(401, "Authentication or stream token required.");
+      }
+      const projectId = safeProjectId(req.params.id);
+      const uid = await resolveStreamUserUid(req, projectId);
+
+      const projectRows = await db
+        .select()
+        .from(videoProjects)
+        .where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, uid)));
+      if (projectRows.length === 0) return res.status(404).json({ error: "Video not found" });
+
       const finalPath = path.join(videoStorageDir, projectId, "final_dubbed.mp4");
       if (!fs.existsSync(finalPath)) return res.status(404).json({ error: "Final video not rendered yet" });
 
@@ -1591,7 +1914,7 @@ async function startServer() {
       }
       streamVideoFile(req, res, finalPath, "video/mp4");
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendHttpError(res, err, "Failed to stream final video");
     }
   });
 
@@ -1637,7 +1960,7 @@ async function startServer() {
       const idToken = authHeader.split("Bearer ")[1];
       const decodedToken = await getAuth(adminApp).verifyIdToken(idToken);
 
-      const projectId = req.params.id;
+      const projectId = safeProjectId(req.params.id);
       await db.delete(videoProjects).where(and(eq(videoProjects.id, projectId), eq(videoProjects.uid, decodedToken.uid)));
 
       const projectDir = path.join(videoStorageDir, projectId);
@@ -1645,21 +1968,64 @@ async function startServer() {
 
       res.json({ success: true });
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendHttpError(res, err, "Failed to delete project");
     }
   });
 
   // ============================================================
   // AI Video Creator — Beta Endpoints (Meta Multimodal + Modal FFmpeg)
   // ============================================================
-  app.post("/api/creator/upload-assets", upload.array("mediaFiles", 10), async (req, res) => {
+  app.get("/api/creator/ping", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    res.json({ ok: true, ts: Date.now() });
+  });
+
+  app.post("/api/creator/upload-assets", async (req, res) => {
     try {
+      const decoded = await requireUser(req);
+
+      await new Promise<void>((resolve, reject) => {
+        creatorUpload.array("mediaFiles", 10)(req, res, (err: any) => {
+          if (!err) return resolve();
+          if (err instanceof HttpError) return reject(err);
+          if (err.code === "LIMIT_FILE_SIZE") {
+            return reject(createHttpError(400, "File size exceeds 50MB limit."));
+          }
+          if (err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE") {
+            return reject(createHttpError(400, "Maximum 10 files allowed per upload."));
+          }
+          return reject(createHttpError(400, err.message || "Invalid file upload."));
+        });
+      });
+
+      const rawProjectId = req.body?.projectId;
+      const projectId =
+        rawProjectId !== undefined && rawProjectId !== null && String(rawProjectId).trim() !== ""
+          ? safeProjectId(rawProjectId)
+          : crypto.randomUUID();
+
+      const existingRows = await db
+        .select()
+        .from(creatorProjects)
+        .where(eq(creatorProjects.id, projectId));
+
+      if (existingRows.length > 0 && existingRows[0].uid !== decoded.uid) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+
       const files = req.files as Express.Multer.File[];
       if (!files || files.length === 0) {
         return res.status(400).json({ error: "No media files uploaded" });
       }
 
-      const projectId = req.body.projectId || crypto.randomUUID();
+      if (existingRows.length === 0) {
+        await db.insert(creatorProjects).values({
+          id: projectId,
+          uid: decoded.uid,
+          createdAt: new Date()
+        });
+      }
+
       const projectDir = path.join(creatorStorageDir, projectId);
       const assetsDir = path.join(projectDir, "assets");
       if (!fs.existsSync(assetsDir)) {
@@ -1669,11 +2035,23 @@ async function startServer() {
       const assets: CreatorAsset[] = [];
       for (const file of files) {
         const assetId = `asset_${crypto.randomUUID().slice(0, 8)}`;
-        const isVideo = file.mimetype.startsWith("video/");
-        const isImage = file.mimetype.startsWith("image/");
+        const mime = (file.mimetype || "").toLowerCase();
+        const origExt = path.extname(file.originalname || "").toLowerCase();
+        const isVideo = mime.startsWith("video/") || [".mp4", ".mov", ".webm", ".m4v"].includes(origExt);
+        const isImage = mime.startsWith("image/") || [".jpg", ".jpeg", ".png", ".webp"].includes(origExt);
         if (!isVideo && !isImage) continue;
 
-        const ext = path.extname(file.originalname) || (isVideo ? ".mp4" : ".png");
+        const safeExtMap: Record<string, string> = {
+          "image/jpeg": ".jpg",
+          "image/jpg": ".jpg",
+          "image/png": ".png",
+          "image/webp": ".webp",
+          "video/mp4": ".mp4",
+          "video/webm": ".webm",
+          "video/quicktime": ".mov",
+          "video/x-m4v": ".m4v"
+        };
+        const ext = safeExtMap[mime] || (ALLOWED_CREATOR_EXTENSIONS.has(origExt) ? origExt : isVideo ? ".mp4" : ".png");
         const savedFilePath = path.join(assetsDir, `${assetId}${ext}`);
         fs.writeFileSync(savedFilePath, file.buffer);
 
@@ -1690,7 +2068,7 @@ async function startServer() {
           type: isVideo ? "video" : "image",
           filePath: savedFilePath,
           originalName: file.originalname,
-          mimeType: file.mimetype,
+          mimeType: file.mimetype || (isVideo ? "video/mp4" : "image/jpeg"),
           durationSec
         });
       }
@@ -1702,123 +2080,1049 @@ async function startServer() {
         assets
       });
     } catch (err: any) {
-      console.error("[Creator] Asset upload error:", err);
-      res.status(500).json({ error: err.message || "Failed to upload creator assets" });
+      sendHttpError(res, err, "Failed to upload creator assets");
     }
   });
 
-  app.post("/api/creator/pipeline-all", async (req, res) => {
+  app.post("/api/creator/upload-chunk", async (req, res) => {
     try {
-      const { projectId, assets, dialect, voice, durationSec, aspectRatio, userPrompt } = req.body;
+      const decoded = await requireUser(req);
 
-      if (!projectId || !Array.isArray(assets) || assets.length === 0) {
-        return res.status(400).json({ error: "Missing required projectId or assets array" });
-      }
-
-      const projectDir = path.join(creatorStorageDir, projectId);
-      if (!fs.existsSync(projectDir)) {
-        fs.mkdirSync(projectDir, { recursive: true });
-      }
-
-      console.log(`[Creator Pipeline] Starting Meta + Modal workflow for project ${projectId}...`);
-
-      // Stage A: Meta Multimodal Asset Analysis (Muse Spark 1.3 + SAM 3.1)
-      console.log(`[Creator Pipeline] Stage A: Multimodal analysis on ${assets.length} assets...`);
-      const analysis = await analyzeCreatorAssets(assets, projectDir);
-
-      // Stage B: Meta Creative Direction
-      console.log(`[Creator Pipeline] Stage B: Meta Creative Direction...`);
-      const targetDurationSec = Number(durationSec) || 15;
-      const targetAspectRatio = ['9:16', '16:9', '1:1'].includes(aspectRatio) ? aspectRatio : '9:16';
-      const creativeDirection = await generateCreatorCreativeDirection(analysis, userPrompt, targetDurationSec, targetAspectRatio);
-
-      // Stage C: Meta Script Generation
-      console.log(`[Creator Pipeline] Stage C: Meta Script Generation (${dialect || 'Algerian Darija'}, voice=${voice || 'ar-DZ-Amir'})...`);
-      const script = await generateCreatorScript(creativeDirection, analysis, dialect || 'Algerian Darija', voice || 'ar-DZ-Amir');
-
-      // Stage D: DoudouVoice TTS Synthesis
-      console.log(`[Creator Pipeline] Stage D: Voice synthesis via DoudouVoice TTS...`);
-      const voiceoverInfo = await synthesizeCreatorVoiceover(script, projectDir);
-
-      // Stage E: Meta Editing Director (Generating Executable Editing Plan)
-      console.log(`[Creator Pipeline] Stage E: Meta Editing Director plan generation...`);
-      const editingPlan = await generateCreatorEditingPlan(creativeDirection, script, analysis, voiceoverInfo, assets, targetDurationSec);
-
-      // Stage 3: Modal Cloud + FFmpeg Video Rendering
-      console.log(`[Creator Pipeline] Stage 3: Rendering video via Modal Cloud / FFmpeg execution engine...`);
-      const finalVideoPath = path.join(projectDir, "final_creator_video.mp4");
-      const renderResult = await executeModalRendering({
-        projectId,
-        assets,
-        editingPlan,
-        masterVoiceoverPath: voiceoverInfo.masterVoiceoverPath,
-        outputFilePath: finalVideoPath
+      await new Promise<void>((resolve, reject) => {
+        creatorChunkUpload.single("chunk")(req, res, (err: any) => {
+          if (!err) return resolve();
+          if (err instanceof HttpError) return reject(err);
+          if (err.code === "LIMIT_FILE_SIZE") {
+            return reject(createHttpError(400, "Chunk size exceeds 16MB limit."));
+          }
+          return reject(createHttpError(400, err.message || "Invalid chunk upload."));
+        });
       });
 
-      if (!renderResult.success) {
-        console.error(`[Creator Pipeline] FFprobe validation failed for project ${projectId}:`, renderResult.error);
-        return res.status(400).json({
-          success: false,
-          error: `Video rendering or FFprobe validation failed: ${renderResult.error}`,
-          renderedVia: renderResult.renderedVia,
-          isModalFallback: renderResult.isModalFallback,
-          validation: renderResult.validation
+      const file = req.file;
+      if (!file) {
+        return res.status(400).json({ error: "No chunk data provided" });
+      }
+
+      const rawProjectId = req.body?.projectId;
+      const projectId =
+        rawProjectId !== undefined && rawProjectId !== null && String(rawProjectId).trim() !== ""
+          ? safeProjectId(rawProjectId)
+          : crypto.randomUUID();
+
+      const uploadId = safeProjectId(req.body?.uploadId);
+      const chunkIndex = Number(req.body?.chunkIndex);
+      const totalChunks = Number(req.body?.totalChunks);
+      const originalName = String(req.body?.originalName || "asset.mp4");
+      const mimeType = String(req.body?.mimeType || "video/mp4").toLowerCase();
+
+      if (!Number.isInteger(chunkIndex) || !Number.isInteger(totalChunks) || chunkIndex < 0 || totalChunks < 1 || chunkIndex >= totalChunks) {
+        throw createHttpError(400, "Invalid chunkIndex or totalChunks.");
+      }
+
+      const origExt = path.extname(originalName).toLowerCase();
+      if (!ALLOWED_CREATOR_MIMETYPES.has(mimeType) && !ALLOWED_CREATOR_EXTENSIONS.has(origExt)) {
+        throw createHttpError(400, `Unsupported file type: ${mimeType}. Allowed: JPEG, PNG, WebP, MP4, MOV, WebM.`);
+      }
+
+      const existingRows = await db
+        .select()
+        .from(creatorProjects)
+        .where(eq(creatorProjects.id, projectId));
+
+      if (existingRows.length > 0 && existingRows[0].uid !== decoded.uid) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+
+      if (existingRows.length === 0) {
+        await db.insert(creatorProjects).values({
+          id: projectId,
+          uid: decoded.uid,
+          createdAt: new Date()
         });
       }
 
-      const finalVideoUrl = `/api/creator/stream/${projectId}/final`;
+      const projectDir = path.join(creatorStorageDir, projectId);
+      const assetsDir = path.join(projectDir, "assets");
+      if (!fs.existsSync(assetsDir)) {
+        fs.mkdirSync(assetsDir, { recursive: true });
+      }
+
+      const partPath = path.join(assetsDir, `part_${uploadId}.tmp`);
+      if (chunkIndex === 0 && fs.existsSync(partPath)) {
+        fs.unlinkSync(partPath);
+      }
+      fs.appendFileSync(partPath, file.buffer);
+
+      const currentSize = fs.statSync(partPath).size;
+      if (currentSize > 50 * 1024 * 1024) {
+        fs.unlinkSync(partPath);
+        throw createHttpError(400, "File size exceeds 50MB limit.");
+      }
+
+      if (chunkIndex + 1 < totalChunks) {
+        return res.json({
+          success: true,
+          completed: false,
+          projectId,
+          chunkIndex
+        });
+      }
+
+      const assetId = `asset_${crypto.randomUUID().slice(0, 8)}`;
+      const isVideo = mimeType.startsWith("video/") || [".mp4", ".mov", ".webm", ".m4v"].includes(origExt);
+      const safeExtMap: Record<string, string> = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+        "video/quicktime": ".mov",
+        "video/x-m4v": ".m4v"
+      };
+      const ext = safeExtMap[mimeType] || (ALLOWED_CREATOR_EXTENSIONS.has(origExt) ? origExt : isVideo ? ".mp4" : ".png");
+      const savedFilePath = path.join(assetsDir, `${assetId}${ext}`);
+      fs.renameSync(partPath, savedFilePath);
+
+      let durationSec: number | undefined = undefined;
+      if (isVideo) {
+        try {
+          const probe = await probeVideo(savedFilePath);
+          durationSec = probe.durationSec;
+        } catch (_) {}
+      }
+
+      const asset: CreatorAsset = {
+        id: assetId,
+        type: isVideo ? "video" : "image",
+        filePath: savedFilePath,
+        originalName,
+        mimeType: mimeType || (isVideo ? "video/mp4" : "image/jpeg"),
+        durationSec
+      };
 
       res.json({
         success: true,
+        completed: true,
         projectId,
+        asset
+      });
+    } catch (err: any) {
+      sendHttpError(res, err, "Failed to upload creator asset chunk");
+    }
+  });
+
+  interface CreatorPipelineJobState {
+    projectId: string;
+    uid: string;
+    status: 'running' | 'completed' | 'failed';
+    stage: number;
+    statusMessage: string;
+    startedAt: number;
+    updatedAt: number;
+    lastHeartbeatAt?: number;
+    committedVideoFilename?: string;
+    partial?: {
+      analysis?: any;
+      creativeDirection?: any;
+      script?: any;
+      editingPlan?: any;
+      editingPlanReviewSummary?: any;
+      finalInspection?: any;
+      repairHistory?: any[];
+    };
+    result?: any;
+    error?: string;
+    httpStatus?: number;
+  }
+
+  const creatorPipelineJobs = new Map<string, CreatorPipelineJobState>();
+
+  const persistCreatorJobState = (projectDir: string, state: CreatorPipelineJobState) => {
+    creatorPipelineJobs.set(state.projectId, state);
+    try {
+      if (fs.existsSync(projectDir)) {
+        fs.writeFileSync(path.join(projectDir, "pipeline_status.json"), JSON.stringify(state, null, 2));
+      }
+    } catch (_) {}
+  };
+
+  const loadCreatorJobState = (projectId: string, projectDir: string): CreatorPipelineJobState | null => {
+    const inMem = creatorPipelineJobs.get(projectId);
+    if (inMem) return inMem;
+    const diskPath = path.join(projectDir, "pipeline_status.json");
+    if (fs.existsSync(diskPath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(diskPath, "utf-8"));
+        if (parsed && parsed.projectId === projectId) {
+          if (parsed.status === 'running' && !activeInMemoryJobIds.has(projectId)) {
+            const finalMp4 = path.join(projectDir, parsed.committedVideoFilename || "final_creator_video.mp4");
+            const lastBeat = parsed.lastHeartbeatAt || parsed.updatedAt || 0;
+            if (fs.existsSync(finalMp4) && fs.statSync(finalMp4).size > 0) {
+              const isFullyVerified =
+                parsed.result?.finalReleaseStatus === 'VERIFIED_AND_RELEASED' ||
+                (parsed.result?.validation?.valid === true && parsed.result?.finalInspection?.decision === 'PASS');
+              parsed.status = 'completed';
+              parsed.stage = 8;
+              parsed.statusMessage = isFullyVerified
+                ? 'Video successfully created and verified!'
+                : 'Render completed (Technical validation passed; review inspection report)';
+              parsed.updatedAt = Date.now();
+              if (!parsed.result) {
+                parsed.result = {
+                  success: true,
+                  status: 'completed',
+                  finalReleaseStatus: isFullyVerified ? 'VERIFIED_AND_RELEASED' : 'UNAPPROVED_BEST_AVAILABLE',
+                  projectId,
+                  provider: 'meta',
+                  finalVideoUrl: `/api/creator/stream/${projectId}/final`,
+                  analysis: parsed.partial?.analysis,
+                  creativeDirection: parsed.partial?.creativeDirection,
+                  script: parsed.partial?.script,
+                  editingPlan: parsed.partial?.editingPlan,
+                  editingPlanReviewSummary: parsed.partial?.editingPlanReviewSummary,
+                  finalInspection: parsed.partial?.finalInspection
+                };
+              }
+              persistCreatorJobState(projectDir, parsed);
+            } else if (Date.now() - lastBeat > 90 * 1000) {
+              parsed.status = 'failed';
+              parsed.error = 'Pipeline execution was interrupted by a server restart. Please start a new run.';
+              parsed.updatedAt = Date.now();
+              persistCreatorJobState(projectDir, parsed);
+            }
+          }
+          creatorPipelineJobs.set(projectId, parsed);
+          return parsed;
+        }
+      } catch (_) {}
+    }
+    return null;
+  };
+
+  const executeCreatorPipelineWorkflow = async (params: {
+    projectId: string;
+    uid: string;
+    projectDir: string;
+    sanitizedAssets: CreatorAsset[];
+    dialect?: string;
+    voice?: string;
+    gender?: 'male' | 'female';
+    style?: string;
+    emotion?: string;
+    speed?: number;
+    pitch?: number;
+    kabyleRegion?: string;
+    durationSec?: number;
+    aspectRatio?: string;
+    userPrompt?: string;
+    releaseSlot: () => void;
+  }): Promise<CreatorPipelineJobState> => {
+    const {
+      projectId,
+      uid,
+      projectDir,
+      sanitizedAssets,
+      dialect = 'Algerian Arabic',
+      voice = 'Puck',
+      gender,
+      style = 'Premium commercial',
+      emotion = 'neutral',
+      speed = 1,
+      pitch = 0,
+      kabyleRegion,
+      durationSec,
+      aspectRatio,
+      userPrompt,
+      releaseSlot
+    } = params;
+
+    const contributorModel = getMetaContributorModel();
+    const reviewerModel = getMetaReviewerModel();
+    const inspectorModel = getMetaInspectorModel();
+
+    activeInMemoryJobIds.add(projectId);
+    const now = Date.now();
+    const jobState: CreatorPipelineJobState = {
+      projectId,
+      uid,
+      status: 'running',
+      stage: 2,
+      statusMessage: `Stage A: Analyzing ${sanitizedAssets.length} media assets via ${contributorModel}...`,
+      startedAt: now,
+      updatedAt: now,
+      lastHeartbeatAt: now,
+      partial: {}
+    };
+    persistCreatorJobState(projectDir, jobState);
+
+    const heartbeatTimer = setInterval(() => {
+      if (jobState.status === 'running') {
+        jobState.lastHeartbeatAt = Date.now();
+        jobState.updatedAt = Date.now();
+        persistCreatorJobState(projectDir, jobState);
+      }
+    }, 10_000);
+
+    try {
+      console.log(`[Creator Pipeline] Starting workflow for project ${projectId} (dialect: ${dialect}, voice: ${voice}, style: ${style}, emotion: ${emotion}, contributor: ${contributorModel}, reviewer: ${reviewerModel})...`);
+
+      // Step 2 (Stage A): Multimodal Asset Analysis via Muse Spark 1.2 Contributor
+      console.log(`[Creator Pipeline] Step 2: Multimodal analysis on ${sanitizedAssets.length} assets...`);
+      const analysis = await analyzeCreatorAssets(sanitizedAssets, projectDir);
+      jobState.stage = 3;
+      jobState.statusMessage = `Step 3: Generating Creative Direction via ${contributorModel}...`;
+      jobState.updatedAt = Date.now();
+      jobState.partial = { ...jobState.partial, analysis };
+      persistCreatorJobState(projectDir, jobState);
+
+      // Step 3 (Stage B): Creative Direction via Muse Spark 1.2 Contributor
+      console.log(`[Creator Pipeline] Step 3: Creative Direction...`);
+      const targetDurationSec = Number(durationSec) || 15;
+      const targetAspectRatio: '9:16' | '16:9' | '1:1' = ['9:16', '16:9', '1:1'].includes(aspectRatio as any)
+        ? (aspectRatio as any)
+        : '9:16';
+      const promptWithVoiceContext = `${userPrompt || ''} [Tone & Delivery Guidance: ${style} style, ${emotion} emotion in ${dialect}]`.trim();
+      const creativeDirection = await generateCreatorCreativeDirection(analysis, promptWithVoiceContext, targetDurationSec, targetAspectRatio);
+      jobState.stage = 4;
+      jobState.statusMessage = `Step 4: Starting Editing Plan & Senior Director Review (${contributorModel} ↔ ${reviewerModel}) before TTS...`;
+      jobState.updatedAt = Date.now();
+      jobState.partial = { ...jobState.partial, creativeDirection };
+      persistCreatorJobState(projectDir, jobState);
+
+      // Step 4: Multi-Model Iterative Editing Plan Generation & Review (Max 5 Cycles) — BEFORE Script & Voice (0 TTS calls)
+      console.log(`[Creator Pipeline] Step 4: Running Iterative Editing Plan Review Loop (max 5 cycles) BEFORE voice synthesis...`);
+      const { selectedPlan: approvedOrBestPlan, reviewSummary: editingPlanReviewSummary } =
+        await runIterativeEditingPlanReviewLoop({
+          creativeDirection,
+          analysis,
+          assets: sanitizedAssets,
+          targetDurationSec,
+          maxCycles: 5,
+          onCycleUpdate: (cycle, msg, versions) => {
+            jobState.stage = 4;
+            jobState.statusMessage = msg;
+            jobState.updatedAt = Date.now();
+            jobState.partial = {
+              ...jobState.partial,
+              editingPlan: versions.length > 0 ? versions[versions.length - 1].plan : undefined,
+              editingPlanReviewSummary: {
+                finalDecision: 'IN_PROGRESS',
+                selectedVersion: cycle,
+                totalCyclesRun: versions.length,
+                maxCyclesAllowed: 5,
+                contributorModel,
+                reviewerModel,
+                finalQualityScore: versions.length > 0 ? versions[versions.length - 1].review.quality_score : 0,
+                versions
+              }
+            };
+            persistCreatorJobState(projectDir, jobState);
+          }
+        });
+
+      jobState.stage = 5;
+      jobState.statusMessage = `Step 5: Generating ${dialect} script matched to ${editingPlanReviewSummary.finalDecision === 'APPROVED' ? `Approved Editing Plan (Cycle ${editingPlanReviewSummary.approvedCycle})` : `Best Plan v${editingPlanReviewSummary.selectedVersion}`}...`;
+      jobState.updatedAt = Date.now();
+      jobState.partial = {
+        ...jobState.partial,
+        editingPlan: approvedOrBestPlan,
+        editingPlanReviewSummary
+      };
+      persistCreatorJobState(projectDir, jobState);
+
+      // Step 5A: Script Generation matched to the locked Editing Plan via Muse Spark 1.2 Contributor
+      console.log(`[Creator Pipeline] Step 5A: Script Generation (${dialect}, voice=${voice}, gender=${gender || 'auto'}, style=${style}, emotion=${emotion}) matched to locked ${approvedOrBestPlan.scenes.length}-scene plan...`);
+      const script = await generateCreatorScript(
+        creativeDirection,
+        analysis,
+        {
+          dialect,
+          voice,
+          gender,
+          style,
+          emotion,
+          speed,
+          pitch,
+          kabyleRegion
+        },
+        voice,
+        approvedOrBestPlan
+      );
+      jobState.stage = 5;
+      jobState.statusMessage = `Step 5: Synthesizing DoudouVoice Studio TTS narration (${script.segments.length} segments)...`;
+      jobState.updatedAt = Date.now();
+      jobState.partial = { ...jobState.partial, script };
+      persistCreatorJobState(projectDir, jobState);
+
+      // Step 5B: Single-Pass DoudouVoice Studio TTS Synthesis for the finalized script
+      console.log(`[Creator Pipeline] Step 5B: Voice synthesis via DoudouVoice Studio TTS (target: ${targetDurationSec}s)...`);
+      const voiceoverInfo = await synthesizeCreatorVoiceover(script, projectDir, targetDurationSec, {
+        gender,
+        style,
+        emotion,
+        speed,
+        pitch,
+        kabyleRegion
+      });
+
+      // Step 5C: Reconcile locked Editing Plan with actual synthesized audio durations without re-calling TTS
+      let currentEditingPlan = await reconcileLockedEditingPlanWithSynthesizedVoiceover({
+        lockedPlan: approvedOrBestPlan,
+        script,
+        voiceoverInfo,
+        assets: sanitizedAssets,
+        analysis,
+        targetDurationSec,
+        creativeDirection
+      });
+
+      jobState.stage = 6;
+      jobState.statusMessage = `Step 6: Rendering commercial MP4 (${editingPlanReviewSummary.finalDecision === 'APPROVED' ? `Approved in Cycle ${editingPlanReviewSummary.approvedCycle}` : `Best Plan v${editingPlanReviewSummary.selectedVersion}`})...`;
+      jobState.updatedAt = Date.now();
+      jobState.partial = {
+        ...jobState.partial,
+        script,
+        editingPlan: currentEditingPlan,
+        editingPlanReviewSummary
+      };
+      persistCreatorJobState(projectDir, jobState);
+
+      // Stage F + Step 7: Modal/FFmpeg Rendering + Programmatic Validation + Muse Spark 1.1 Final Inspection + Repair Loop (Max 2 Repair Cycles)
+      const maxRepairCycles = 2;
+      const repairHistory: Array<{
+        repairCycle: number;
+        videoPath: string;
+        editingPlan: any;
+        renderResult: ModalRenderingResult;
+        inspectionReport: FinalVideoInspectionReport;
+      }> = [];
+
+      let passedAttempt: {
+        repairCycle: number;
+        videoPath: string;
+        editingPlan: any;
+        renderResult: ModalRenderingResult;
+        inspectionReport: FinalVideoInspectionReport;
+      } | null = null;
+
+      for (let repairCycle = 0; repairCycle <= maxRepairCycles; repairCycle++) {
+        const candidateVideoFilename =
+          repairCycle === 0
+            ? "final_creator_video.mp4"
+            : `final_creator_video_repair_${repairCycle}.mp4`;
+        const candidateVideoPath = path.join(projectDir, candidateVideoFilename);
+
+        jobState.stage = 6;
+        jobState.statusMessage =
+          repairCycle === 0
+            ? 'Stage F: Rendering commercial MP4 via Modal Cloud / FFmpeg engine...'
+            : `Stage F (Repair ${repairCycle}/${maxRepairCycles}): Re-rendering repaired Editing Plan...`;
+        jobState.updatedAt = Date.now();
+        persistCreatorJobState(projectDir, jobState);
+
+        console.log(`[Creator Pipeline] Rendering attempt (repairCycle=${repairCycle}/${maxRepairCycles})...`);
+        const renderResult = await executeModalRendering({
+          projectId,
+          assets: sanitizedAssets,
+          editingPlan: currentEditingPlan,
+          masterVoiceoverPath: voiceoverInfo.masterVoiceoverPath,
+          outputFilePath: candidateVideoPath
+        });
+
+        jobState.stage = 7;
+        jobState.statusMessage =
+          repairCycle === 0
+            ? `Step 7: Inspecting rendered MP4 with ${inspectorModel} & FFprobe technical validation...`
+            : `Step 7 (Repair ${repairCycle}/${maxRepairCycles}): Re-inspecting repaired MP4 with ${inspectorModel}...`;
+        jobState.updatedAt = Date.now();
+        persistCreatorJobState(projectDir, jobState);
+
+        const inspectionReport = await inspectRenderedVideoWithMuseSpark11({
+          videoPath: candidateVideoPath,
+          editingPlan: currentEditingPlan,
+          creativeDirection,
+          script,
+          technicalValidation: renderResult.validation,
+          outputDir: projectDir,
+          repairCycle
+        });
+
+        const attemptRecord = {
+          repairCycle,
+          videoPath: candidateVideoPath,
+          editingPlan: JSON.parse(JSON.stringify(currentEditingPlan)),
+          renderResult,
+          inspectionReport
+        };
+        repairHistory.push(attemptRecord);
+
+        jobState.partial = {
+          ...jobState.partial,
+          editingPlan: currentEditingPlan,
+          finalInspection: inspectionReport,
+          repairHistory: repairHistory.map(r => ({
+            repairCycle: r.repairCycle,
+            renderedVia: r.renderResult.renderedVia,
+            technicalValid: r.renderResult.validation.valid,
+            inspectionDecision: r.inspectionReport.decision,
+            qualityScore: r.inspectionReport.quality_score,
+            detectedIssues: r.inspectionReport.detected_issues
+          }))
+        };
+        persistCreatorJobState(projectDir, jobState);
+
+        console.log(
+          `[Final Quality Gate] Attempt r${repairCycle}: technicalValid=${renderResult.validation.valid}, inspectionDecision=${inspectionReport.decision}, score=${inspectionReport.quality_score}/100`
+        );
+
+        if (renderResult.success && renderResult.validation.valid && inspectionReport.decision === 'PASS') {
+          passedAttempt = attemptRecord;
+          break;
+        }
+
+        if (repairCycle < maxRepairCycles) {
+          console.log(
+            `[Final Quality Gate] Inspection/validation failed on r${repairCycle}. Initiating repair cycle ${repairCycle + 1}/${maxRepairCycles} via ${contributorModel}...`
+          );
+          currentEditingPlan = await repairEditingPlanFromInspection({
+            currentPlan: currentEditingPlan,
+            inspectionReport,
+            creativeDirection,
+            script,
+            analysis,
+            voiceoverInfo,
+            assets: sanitizedAssets,
+            targetDurationSec,
+            repairCycle: repairCycle + 1
+          });
+        }
+      }
+
+      const canonicalFinalVideoPath = path.join(projectDir, "final_creator_video.mp4");
+
+      // Select winning attempt: either passedAttempt or the highest-scoring technically valid attempt
+      let selectedAttempt = passedAttempt;
+      let finalReleaseStatus: 'VERIFIED_AND_RELEASED' | 'UNAPPROVED_BEST_AVAILABLE' = 'VERIFIED_AND_RELEASED';
+
+      if (!selectedAttempt) {
+        const technicallyValidAttempts = repairHistory.filter(
+          a => a.renderResult.success && a.renderResult.validation.valid && fs.existsSync(a.videoPath)
+        );
+
+        if (technicallyValidAttempts.length === 0) {
+          const lastAttempt = repairHistory[repairHistory.length - 1];
+          const errDetail = lastAttempt?.renderResult.error || lastAttempt?.inspectionReport.detected_issues.join(' | ') || 'Technical validation failed';
+          const failPayload = {
+            success: false,
+            error: `Video rendering or mandatory technical validation failed after ${repairHistory.length} attempt(s): ${errDetail}`,
+            renderedVia: lastAttempt?.renderResult.renderedVia,
+            isModalFallback: lastAttempt?.renderResult.isModalFallback,
+            validation: lastAttempt?.renderResult.validation,
+            finalInspection: lastAttempt?.inspectionReport,
+            editingPlanReviewSummary,
+            repairHistory: repairHistory.map(r => ({
+              repairCycle: r.repairCycle,
+              renderedVia: r.renderResult.renderedVia,
+              technicalValid: r.renderResult.validation.valid,
+              inspectionDecision: r.inspectionReport.decision,
+              qualityScore: r.inspectionReport.quality_score,
+              detectedIssues: r.inspectionReport.detected_issues
+            }))
+          };
+          jobState.status = 'failed';
+          jobState.error = failPayload.error;
+          jobState.result = failPayload;
+          jobState.httpStatus = 400;
+          jobState.updatedAt = Date.now();
+          persistCreatorJobState(projectDir, jobState);
+          return jobState;
+        }
+
+        // Preserve best technically valid rendered version without falsely marking it as approved
+        selectedAttempt = technicallyValidAttempts.reduce((best, curr) =>
+          curr.inspectionReport.quality_score >= best.inspectionReport.quality_score ? curr : best
+        , technicallyValidAttempts[0]);
+        finalReleaseStatus = 'UNAPPROVED_BEST_AVAILABLE';
+      }
+
+      // Ensure canonical final_creator_video.mp4 points to the selected winning MP4
+      if (selectedAttempt.videoPath !== canonicalFinalVideoPath && fs.existsSync(selectedAttempt.videoPath)) {
+        fs.copyFileSync(selectedAttempt.videoPath, canonicalFinalVideoPath);
+        try {
+          fs.writeFileSync(`${canonicalFinalVideoPath}.qt_mac_ready`, String(Date.now()));
+        } catch (_) {}
+      }
+
+      const finalVideoUrl = `/api/creator/stream/${projectId}/final`;
+      const provider = script.provider || creativeDirection.provider || selectedAttempt.editingPlan.provider || 'meta';
+      const model = script.model || creativeDirection.model || selectedAttempt.editingPlan.model || contributorModel;
+
+      const isFullyVerified =
+        finalReleaseStatus === 'VERIFIED_AND_RELEASED' &&
+        selectedAttempt.renderResult.validation.valid &&
+        selectedAttempt.inspectionReport.decision === 'PASS' &&
+        editingPlanReviewSummary.finalDecision === 'APPROVED';
+
+      const finalStatusMessage = isFullyVerified
+        ? 'Video successfully created and verified!'
+        : finalReleaseStatus === 'VERIFIED_AND_RELEASED'
+        ? 'Video rendered and passed final inspection (Editing Plan used best available version)'
+        : 'Render completed (Technical validation passed; Final AI inspection reported unresolved issues)';
+
+      const successPayload = {
+        success: true,
+        status: 'completed',
+        finalReleaseStatus: isFullyVerified ? 'VERIFIED_AND_RELEASED' : 'UNAPPROVED_BEST_AVAILABLE',
+        renderCompleted: true,
+        technicalValidationPassed: selectedAttempt.renderResult.validation.valid,
+        aiVisualInspectionPassed: selectedAttempt.inspectionReport.decision === 'PASS',
+        editingPlanApproved: editingPlanReviewSummary.finalDecision === 'APPROVED',
+        finalVideoReleased: true,
+        projectId,
+        provider,
+        model,
+        modelsUsed: {
+          contributor: contributorModel,
+          reviewer: reviewerModel,
+          inspector: inspectorModel,
+          tts: 'gemini-3.1-flash-tts-preview'
+        },
         finalVideoUrl,
-        renderedVia: renderResult.renderedVia,
-        isModalFallback: renderResult.isModalFallback,
-        hasAudioInputSupplied: renderResult.hasAudioInputSupplied,
-        videoOnly: renderResult.videoOnly,
-        durationSec: renderResult.durationSec,
-        fileSizeBytes: renderResult.fileSizeBytes,
-        validation: renderResult.validation,
+        renderedVia: selectedAttempt.renderResult.renderedVia,
+        isModalFallback: selectedAttempt.renderResult.isModalFallback,
+        hasAudioInputSupplied: selectedAttempt.renderResult.hasAudioInputSupplied,
+        videoOnly: selectedAttempt.renderResult.videoOnly,
+        durationSec: selectedAttempt.renderResult.durationSec,
+        fileSizeBytes: selectedAttempt.renderResult.fileSizeBytes,
+        validation: selectedAttempt.renderResult.validation,
         analysis,
         creativeDirection,
         script,
-        editingPlan,
+        editingPlan: selectedAttempt.editingPlan,
+        editingPlanReviewSummary,
+        finalInspection: selectedAttempt.inspectionReport,
+        repairCyclesRun: repairHistory.length - 1,
+        maxRepairCyclesAllowed: maxRepairCycles,
+        repairHistory: repairHistory.map(r => ({
+          repairCycle: r.repairCycle,
+          renderedVia: r.renderResult.renderedVia,
+          technicalValid: r.renderResult.validation.valid,
+          inspectionDecision: r.inspectionReport.decision,
+          qualityScore: r.inspectionReport.quality_score,
+          detectedIssues: r.inspectionReport.detected_issues,
+          approvalReason: r.inspectionReport.approval_reason
+        })),
         voiceoverInfo: {
           totalDurationSec: voiceoverInfo.totalVoiceoverDurationSec,
           segmentsCount: voiceoverInfo.audioSegments.length
         }
-      });
+      };
+
+      jobState.status = 'completed';
+      jobState.stage = 8;
+      jobState.statusMessage = finalStatusMessage;
+      jobState.committedVideoFilename = "final_creator_video.mp4";
+      jobState.result = successPayload;
+      jobState.httpStatus = 200;
+      jobState.updatedAt = Date.now();
+      jobState.lastHeartbeatAt = Date.now();
+      persistCreatorJobState(projectDir, jobState);
+      return jobState;
     } catch (err: any) {
-      console.error("[Creator Pipeline] Execution error:", err);
-      res.status(500).json({ error: err.message || "Pipeline execution failed" });
+      const errMsg = err?.message || "Pipeline execution failed";
+      const httpStatus =
+        err instanceof HttpError
+          ? err.status
+          : typeof err?.message === "string" && (err.message.includes("META_STRICT") || err.message.includes("META_API_KEY"))
+          ? 503
+          : 500;
+      jobState.status = 'failed';
+      jobState.error = errMsg;
+      jobState.httpStatus = httpStatus;
+      jobState.updatedAt = Date.now();
+      persistCreatorJobState(projectDir, jobState);
+      return jobState;
+    } finally {
+      clearInterval(heartbeatTimer);
+      activeInMemoryJobIds.delete(projectId);
+      releaseSlot();
+    }
+  };
+
+  app.post("/api/creator/pipeline-all", async (req, res) => {
+    let releaseSlot: (() => void) | null = null;
+    let slotTransferredToJob = false;
+    try {
+      const decoded = await requireUser(req);
+      const {
+        projectId: rawProjectId,
+        assets,
+        dialect = 'Algerian Arabic',
+        voice = 'Puck',
+        gender,
+        style = 'Premium commercial',
+        emotion = 'neutral',
+        speed = 1,
+        pitch = 0,
+        kabyleRegion,
+        durationSec,
+        aspectRatio,
+        userPrompt,
+        async: runAsync
+      } = req.body || {};
+
+      const projectId = safeProjectId(rawProjectId);
+
+      const ownerRows = await db
+        .select()
+        .from(creatorProjects)
+        .where(and(eq(creatorProjects.id, projectId), eq(creatorProjects.uid, decoded.uid)));
+      if (ownerRows.length === 0) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+
+      if (!Array.isArray(assets) || assets.length === 0) {
+        return res.status(400).json({ error: "Missing required assets array" });
+      }
+
+      const projectDir = path.resolve(creatorStorageDir, projectId);
+      if (!fs.existsSync(projectDir)) {
+        fs.mkdirSync(projectDir, { recursive: true });
+      }
+
+      // If a job for this project is already running, return its active running status instead of starting a duplicate
+      const existingJob = creatorPipelineJobs.get(projectId);
+      if (existingJob && existingJob.status === 'running') {
+        return res.status(202).json({
+          success: true,
+          status: 'running',
+          jobId: projectId,
+          projectId,
+          stage: existingJob.stage,
+          statusMessage: existingJob.statusMessage,
+          partial: existingJob.partial
+        });
+      }
+
+      // Sanitize asset paths so they must reside inside projectDir
+      const sanitizedAssets: CreatorAsset[] = assets.map((a: any) => {
+        const resolvedPath = path.resolve(String(a?.filePath || ""));
+        if (!resolvedPath.startsWith(projectDir + path.sep)) {
+          throw createHttpError(400, "Invalid asset filePath.");
+        }
+        return {
+          id: String(a.id || ""),
+          type: a.type === "video" ? "video" : "image",
+          filePath: resolvedPath,
+          originalName: String(a.originalName || "asset"),
+          mimeType: String(a.mimeType || "image/jpeg"),
+          durationSec: typeof a.durationSec === "number" ? a.durationSec : undefined
+        };
+      });
+
+      releaseSlot = acquireCreatorPipelineSlot(decoded.uid, projectId);
+      slotTransferredToJob = true;
+
+      const jobPromise = executeCreatorPipelineWorkflow({
+        projectId,
+        uid: decoded.uid,
+        projectDir,
+        sanitizedAssets,
+        dialect,
+        voice,
+        gender,
+        style,
+        emotion,
+        speed: typeof speed === 'number' ? speed : 1,
+        pitch: typeof pitch === 'number' ? pitch : 0,
+        kabyleRegion,
+        durationSec,
+        aspectRatio,
+        userPrompt,
+        releaseSlot
+      });
+
+      if (runAsync === true) {
+        jobPromise.catch(e => console.error(`[Creator Pipeline] Background job error for ${projectId}:`, e));
+        return res.status(202).json({
+          success: true,
+          status: 'running',
+          jobId: projectId,
+          projectId,
+          stage: 2,
+          statusMessage: `Stage A: Analyzing ${sanitizedAssets.length} media assets via ${getMetaContributorModel()}...`
+        });
+      }
+
+      const finishedJob = await jobPromise;
+      if (finishedJob.status === 'failed') {
+        if (finishedJob.result) {
+          return res.status(finishedJob.httpStatus || 400).json(finishedJob.result);
+        }
+        return res.status(finishedJob.httpStatus || 500).json({ error: finishedJob.error || "Pipeline execution failed" });
+      }
+
+      return res.status(200).json(finishedJob.result);
+    } catch (err: any) {
+      if (!slotTransferredToJob && releaseSlot) {
+        releaseSlot();
+      }
+      if (err instanceof HttpError) {
+        return sendHttpError(res, err, "Pipeline execution failed");
+      }
+      if (typeof err?.message === "string" && (err.message.includes("META_STRICT") || err.message.includes("META_API_KEY"))) {
+        return res.status(503).json({ error: err.message });
+      }
+      sendHttpError(res, err, "Pipeline execution failed");
     }
   });
 
+  app.get("/api/creator/status/:projectId", async (req, res) => {
+    try {
+      res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      const decoded = await requireUser(req);
+      const projectId = safeProjectId(req.params.projectId);
+      const projectDir = path.resolve(creatorStorageDir, projectId);
+
+      const ownerRows = await db
+        .select()
+        .from(creatorProjects)
+        .where(and(eq(creatorProjects.id, projectId), eq(creatorProjects.uid, decoded.uid)));
+
+      const jobState = loadCreatorJobState(projectId, projectDir);
+
+      if (ownerRows.length === 0) {
+        if (!jobState || jobState.uid !== decoded.uid) {
+          return res.status(404).json({ error: "Project not found" });
+        }
+        try {
+          await db.insert(creatorProjects).values({
+            id: projectId,
+            uid: decoded.uid,
+            createdAt: new Date(jobState.startedAt || Date.now())
+          }).onConflictDoNothing();
+        } catch (_) {}
+      }
+
+      if (jobState) {
+        return res.json({
+          success: jobState.status !== 'failed',
+          projectId,
+          status: jobState.status,
+          stage: jobState.stage,
+          statusMessage: jobState.statusMessage,
+          partial: jobState.partial,
+          result: jobState.result,
+          error: jobState.error
+        });
+      }
+
+      const finalVideoPath = path.join(projectDir, "final_creator_video.mp4");
+      if (fs.existsSync(finalVideoPath)) {
+        const stat = fs.statSync(finalVideoPath);
+        return res.json({
+          success: true,
+          projectId,
+          status: 'completed',
+          stage: 8,
+          statusMessage: 'Render completed (Recovered from disk)',
+          result: {
+            success: true,
+            finalReleaseStatus: 'UNAPPROVED_BEST_AVAILABLE',
+            projectId,
+            provider: 'meta',
+            finalVideoUrl: `/api/creator/stream/${projectId}/final`,
+            fileSizeBytes: stat.size
+          }
+        });
+      }
+
+      return res.json({
+        success: true,
+        projectId,
+        status: 'idle',
+        stage: 0,
+        statusMessage: 'No active pipeline job found for this project.'
+      });
+    } catch (err: any) {
+      sendHttpError(res, err, "Failed to retrieve creator pipeline status");
+    }
+  });
+
+  app.get("/api/creator/active-job", async (req, res) => {
+    try {
+      res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      const decoded = await requireUser(req);
+      const userProjects = await db
+        .select()
+        .from(creatorProjects)
+        .where(eq(creatorProjects.uid, decoded.uid))
+        .orderBy(desc(creatorProjects.createdAt))
+        .limit(20);
+
+      const candidateProjectIds = new Set<string>();
+      for (const proj of userProjects) {
+        candidateProjectIds.add(proj.id);
+      }
+
+      try {
+        if (fs.existsSync(creatorStorageDir)) {
+          const diskEntries = fs.readdirSync(creatorStorageDir, { withFileTypes: true });
+          for (const ent of diskEntries) {
+            if (ent.isDirectory() && /^[a-zA-Z0-9_-]{8,64}$/.test(ent.name)) {
+              candidateProjectIds.add(ent.name);
+            }
+          }
+        }
+      } catch (_) {}
+
+      let activeJob: CreatorPipelineJobState | null = null;
+      let latestCompletedJob: CreatorPipelineJobState | null = null;
+
+      for (const pId of candidateProjectIds) {
+        const projectDir = path.resolve(creatorStorageDir, pId);
+        const state = loadCreatorJobState(pId, projectDir);
+        if (!state || state.uid !== decoded.uid) continue;
+
+        if (state.status === 'running') {
+          if (!activeJob || state.updatedAt > activeJob.updatedAt) {
+            activeJob = state;
+          }
+        } else if (state.status === 'completed') {
+          const videoFile = path.join(projectDir, state.committedVideoFilename || "final_creator_video.mp4");
+          if (fs.existsSync(videoFile)) {
+            if (!latestCompletedJob || state.updatedAt > latestCompletedJob.updatedAt) {
+              latestCompletedJob = state;
+            }
+          }
+        }
+      }
+
+      if (activeJob) {
+        return res.json({
+          success: true,
+          hasActiveJob: true,
+          job: {
+            projectId: activeJob.projectId,
+            status: activeJob.status,
+            stage: activeJob.stage,
+            statusMessage: activeJob.statusMessage,
+            startedAt: activeJob.startedAt,
+            updatedAt: activeJob.updatedAt,
+            partial: activeJob.partial,
+            result: activeJob.result
+          }
+        });
+      }
+
+      return res.json({
+        success: true,
+        hasActiveJob: false,
+        latestJob: latestCompletedJob
+          ? {
+              projectId: latestCompletedJob.projectId,
+              status: latestCompletedJob.status,
+              stage: latestCompletedJob.stage,
+              statusMessage: latestCompletedJob.statusMessage,
+              startedAt: latestCompletedJob.startedAt,
+              updatedAt: latestCompletedJob.updatedAt,
+              partial: latestCompletedJob.partial,
+              result: latestCompletedJob.result
+            }
+          : null
+      });
+    } catch (err: any) {
+      sendHttpError(res, err, "Failed to check active creator job");
+    }
+  });
+
+  // Pre-normalize any existing completed Creator MP4s in background so macOS QuickTime playback works immediately
+  setTimeout(async () => {
+    try {
+      if (!fs.existsSync(creatorStorageDir)) return;
+      const entries = fs.readdirSync(creatorStorageDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const candidateMp4 = path.join(creatorStorageDir, entry.name, "final_creator_video.mp4");
+        if (fs.existsSync(candidateMp4)) {
+          await ensureQuickTimeCompatibleMp4(candidateMp4);
+        }
+      }
+    } catch (_) {}
+  }, 500);
+
   app.get("/api/creator/stream/:projectId/final", async (req, res) => {
     try {
-      const { projectId } = req.params;
-      const finalVideoPath = path.join(creatorStorageDir, projectId, "final_creator_video.mp4");
+      if (!hasAuthOrStreamToken(req)) {
+        throw createHttpError(401, "Authentication or stream token required.");
+      }
+      const projectId = safeProjectId(req.params.projectId);
+      const uid = await resolveStreamUserUid(req, projectId);
+      const projectDir = path.join(creatorStorageDir, projectId);
 
+      const ownerRows = await db
+        .select()
+        .from(creatorProjects)
+        .where(and(eq(creatorProjects.id, projectId), eq(creatorProjects.uid, uid)));
+
+      const jobState = loadCreatorJobState(projectId, projectDir);
+
+      if (ownerRows.length === 0) {
+        if (!jobState || jobState.uid !== uid) {
+          return res.status(404).json({ error: "Project not found" });
+        }
+        try {
+          await db.insert(creatorProjects).values({
+            id: projectId,
+            uid,
+            createdAt: new Date(jobState.startedAt || Date.now())
+          }).onConflictDoNothing();
+        } catch (_) {}
+      }
+
+      const preferredFilename = jobState?.committedVideoFilename || "final_creator_video.mp4";
+      let finalVideoPath = path.join(projectDir, preferredFilename);
+      if (!fs.existsSync(finalVideoPath)) {
+        finalVideoPath = path.join(projectDir, "final_creator_video.mp4");
+      }
       if (!fs.existsSync(finalVideoPath)) {
         return res.status(404).json({ error: "Final creator video not found or not rendered yet" });
       }
 
+      await ensureQuickTimeCompatibleMp4(finalVideoPath);
+
       if (req.query.download === "true") {
-        res.setHeader("Content-Disposition", 'attachment; filename="meta_ai_creator_video.mp4"');
+        res.setHeader("Content-Disposition", 'attachment; filename="doudouvoice_ai_creator_video.mp4"');
       }
 
       streamVideoFile(req, res, finalVideoPath, "video/mp4");
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendHttpError(res, err, "Failed to stream creator video");
     }
   });
 
   app.get("/api/creator/audio/:projectId/:filename", async (req, res) => {
     try {
-      const { projectId, filename } = req.params;
-      if (!/^[a-zA-Z0-9_\-]+$/.test(projectId) || !/^[a-zA-Z0-9_\-]+\.wav$/.test(filename)) {
-        return res.status(400).json({ error: "Invalid audio path parameters" });
+      if (!hasAuthOrStreamToken(req)) {
+        throw createHttpError(401, "Authentication or stream token required.");
       }
+      const projectId = safeProjectId(req.params.projectId);
+      const { filename } = req.params;
+      if (!/^[a-zA-Z0-9_-]+\.wav$/.test(filename)) {
+        throw createHttpError(400, "Invalid audio filename.");
+      }
+      const uid = await resolveStreamUserUid(req, projectId);
+
+      const ownerRows = await db
+        .select()
+        .from(creatorProjects)
+        .where(and(eq(creatorProjects.id, projectId), eq(creatorProjects.uid, uid)));
+      if (ownerRows.length === 0) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+
       const audioPath = path.join(creatorStorageDir, projectId, filename);
       if (!fs.existsSync(audioPath)) {
         return res.status(404).json({ error: "Audio segment not found" });
@@ -1826,7 +3130,92 @@ async function startServer() {
       res.setHeader("Content-Type", "audio/wav");
       res.sendFile(audioPath);
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      sendHttpError(res, err, "Failed to serve creator audio");
+    }
+  });
+
+  // Quick Voice Preview for AI Creator
+  app.post("/api/creator/voice-preview", async (req, res) => {
+    try {
+      const {
+        voice = 'Puck',
+        dialect = 'Algerian Arabic',
+        gender = 'male',
+        style = 'Friendly',
+        emotion = 'neutral',
+        speed = 1,
+        pitch = 0,
+        kabyleRegion
+      } = req.body || {};
+
+      const isEnglish = dialect === 'American English (US)' || dialect === 'British English (UK)';
+      const isKabyle = dialect === 'Algerian Kabyle (Taqbaylit)';
+
+      const sampleText = isEnglish
+        ? "Hello! This is a preview of my voice for your video campaign."
+        : isKabyle
+        ? "Ansuf yis-wen! Wagi d aheggi n taɣect-iw i usenfar-ik."
+        : dialect === 'Saudi Arabic'
+        ? "مرحباً بك! هذه عينة من صوتي لإعلانك القادم في المملكة."
+        : dialect === 'Emirati Arabic (Dubai / UAE)'
+        ? "مرحباً بكم! هذه عينة من صوتي لإعلانك القادم في الإمارات."
+        : dialect === 'Egyptian Arabic'
+        ? "أهلاً بيك! دي عينة من صوتي لإعلانك التجاري الجديد."
+        : "مرحباً بك! هذه عينة من صوتي لإعلانك التجاري القادم.";
+
+      const cacheKey = `prev_${voice}_${dialect}_${style}_${emotion}_${speed}_${pitch}_${kabyleRegion || ''}`;
+      const hash = crypto.createHash('md5').update(cacheKey).digest('hex').slice(0, 16);
+      const filename = `preview_${hash}.wav`;
+      const filePath = path.join(cacheDir, filename);
+
+      if (fs.existsSync(filePath) && fs.statSync(filePath).size > 44) {
+        return res.json({ success: true, audioUrl: `/api/audio/preview_${hash}.wav` });
+      }
+
+      const resolvedVoice = mapCreatorVoiceToGemini(voice);
+      const result = await synthesizeSegmentWithStudioFallback(
+        {
+          id: `prev_${hash}`,
+          text: sampleText,
+          pace: speed > 1.1 ? 'fast' : speed < 0.9 ? 'slow' : 'normal',
+          emotion: emotion as any
+        },
+        {
+          dialect,
+          voice: resolvedVoice,
+          gender,
+          style,
+          emotion,
+          speed,
+          pitch,
+          kabyleRegion,
+          cacheDir
+        }
+      );
+
+      const pcmBuffer = result.rawPcm;
+      const header = Buffer.alloc(44);
+      header.write('RIFF', 0);
+      header.writeUInt32LE(36 + pcmBuffer.length, 4);
+      header.write('WAVE', 8);
+      header.write('fmt ', 12);
+      header.writeUInt32LE(16, 16);
+      header.writeUInt16LE(1, 20);
+      header.writeUInt16LE(1, 22);
+      header.writeUInt32LE(24000, 24);
+      header.writeUInt32LE(48000, 28);
+      header.writeUInt16LE(2, 32);
+      header.writeUInt16LE(16, 34);
+      header.write('data', 36);
+      header.writeUInt32LE(pcmBuffer.length, 40);
+
+      const wavBuffer = Buffer.concat([header, pcmBuffer]);
+      fs.writeFileSync(filePath, wavBuffer);
+
+      return res.json({ success: true, audioUrl: `/api/audio/preview_${hash}.wav` });
+    } catch (err: any) {
+      console.warn("[Voice Preview] Preview generation warning:", err?.message || err);
+      sendHttpError(res, err, "Failed to generate voice preview");
     }
   });
 
@@ -2438,24 +3827,45 @@ async function startServer() {
     }
   });
 
+  // Express error middleware: map errors with a status field to HTTP status codes without leaking stack traces
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    sendHttpError(res, err, "Internal server error");
+  });
+
   // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+  if (!options?.skipVite) {
+    if (process.env.NODE_ENV !== "production") {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(process.cwd(), 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    }
   }
 
+  return app;
+}
+
+async function startServer() {
+  const PORT = 3000;
+  const app = await createApp();
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 
-startServer();
+const entryBasename = process.argv[1] ? path.basename(process.argv[1]) : "";
+const isMainServerEntry =
+  entryBasename === "server.ts" ||
+  entryBasename === "server.cjs" ||
+  entryBasename === "server.js";
+
+if (isMainServerEntry && process.env.DOUDOU_TEST_MODE !== "true") {
+  startServer();
+}

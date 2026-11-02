@@ -1,7 +1,8 @@
 import { GoogleGenAI } from '@google/genai';
 import fs from 'node:fs';
 import path from 'node:path';
-import { defaultMetaClient } from './metaClient.js';
+import { AiProviderType, MetaChatResponse } from './metaClient.js';
+import { getMetaModel, getMetaImageModel, isMetaStrict, GEMINI_FALLBACK_MODEL } from './metaConfig.js';
 import { ExtractedFrame } from './videoService.js';
 
 export interface SceneAnalysis {
@@ -17,6 +18,7 @@ export interface SceneAnalysis {
 
 export interface VideoUnderstandingResult {
   success: boolean;
+  provider?: AiProviderType;
   model: string;
   durationSec: number;
   scenes: SceneAnalysis[];
@@ -45,6 +47,7 @@ export interface VoiceoverSegment {
 
 export interface DubbingGenerationResult {
   success: boolean;
+  provider?: AiProviderType;
   model: string;
   segments: VoiceoverSegment[];
   suggestedTtsSettings: {
@@ -62,6 +65,8 @@ export interface DubbingGenerationResult {
 
 export interface VideoLocalizationResult {
   success: boolean;
+  provider?: AiProviderType;
+  model?: string;
   originalTranscript: Array<{ startTimeSec: number; endTimeSec: number; speaker?: string; text: string }>;
   localizedSegments: VoiceoverSegment[];
   error?: string;
@@ -93,62 +98,109 @@ function extractJson(text: string): any {
 
 export class MetaVideoClient {
   private baseUrl: string;
-  private apiKey: string;
-  private model: string;
-  private imageModel: string;
   private timeoutMs: number;
 
   constructor() {
     this.baseUrl = (process.env.META_API_URL || process.env.META_BASE_URL || 'https://api.meta.ai/v1').replace(/\/+$/, '');
-    this.apiKey = process.env.META_API_KEY || '';
-    this.model = process.env.META_MODEL || 'muse-spark-1.2-contributor';
-    this.imageModel = process.env.META_IMAGE_MODEL || 'muse-spark-1.2-contributor';
     this.timeoutMs = 45000;
   }
 
+  private get apiKey(): string {
+    return process.env.META_API_KEY || '';
+  }
+
+  private get model(): string {
+    return getMetaModel();
+  }
+
+  private get imageModel(): string {
+    return getMetaImageModel();
+  }
+
   /**
-   * Helper to call Meta Model API (POST /chat/completions) with timeout.
+   * Helper to call Meta Model API (POST /chat/completions) with timeout and honest provider reporting.
    */
-  private async callMetaChat(messages: Array<{ role: string; content: string }>, temperature = 0.4): Promise<any> {
-    if (!this.apiKey) {
-      throw new Error('META_API_KEY is not configured in the environment.');
+  async callMetaChat(messages: Array<{ role: string; content: string }>, temperature = 0.4): Promise<MetaChatResponse> {
+    if (this.apiKey) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+      try {
+        const res = await fetch(`${this.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: this.model,
+            messages,
+            temperature
+          }),
+          signal: controller.signal
+        });
+
+        const contentType = res.headers.get('content-type') || '';
+        let data: any = null;
+        if (contentType.includes('application/json')) {
+          data = await res.json();
+        } else {
+          const text = await res.text();
+          throw new Error(`Meta API returned non-JSON (${res.status}): ${text.slice(0, 200)}`);
+        }
+
+        if (!res.ok) {
+          throw new Error(`Meta API error (${res.status}): ${data?.error?.message || data?.error || JSON.stringify(data)}`);
+        }
+
+        return {
+          data,
+          provider: 'meta',
+          model: this.model
+        };
+      } catch (metaErr: any) {
+        if (isMetaStrict()) {
+          throw new Error(`META_STRICT is enabled: Meta API failed (${metaErr.message}) and Gemini fallback is disabled.`);
+        }
+        console.warn(`[MetaVideo] Meta API call failed (${metaErr.message}), falling back to Gemini...`);
+      } finally {
+        clearTimeout(timer);
+      }
+    } else if (isMetaStrict()) {
+      throw new Error('META_STRICT is enabled and META_API_KEY is not configured. Gemini fallback is disabled.');
     }
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-    try {
-      const res = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          model: this.model,
-          messages,
-          temperature
-        }),
-        signal: controller.signal
-      });
-
-      const contentType = res.headers.get('content-type') || '';
-      let data: any = null;
-      if (contentType.includes('application/json')) {
-        data = await res.json();
-      } else {
-        const text = await res.text();
-        throw new Error(`Meta API returned non-JSON (${res.status}): ${text.slice(0, 200)}`);
-      }
-
-      if (!res.ok) {
-        throw new Error(`Meta API error (${res.status}): ${data?.error?.message || data?.error || JSON.stringify(data)}`);
-      }
-
-      return data;
-    } finally {
-      clearTimeout(timer);
+    const geminiKey = process.env.gemini_api_key1 || process.env.gemini_api_key2 || process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      throw new Error('Neither META_API_KEY nor GEMINI_API_KEY is configured.');
     }
+
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    const systemMsg = messages.find(m => m.role === 'system')?.content || '';
+    const userPrompt = messages.filter(m => m.role !== 'system').map(m => `${m.role.toUpperCase()}:\n${m.content}`).join('\n\n');
+
+    const response = await ai.models.generateContent({
+      model: GEMINI_FALLBACK_MODEL,
+      contents: userPrompt,
+      config: {
+        systemInstruction: systemMsg || undefined,
+        temperature
+      }
+    });
+
+    const text = response.text || '{}';
+    return {
+      data: {
+        choices: [{ message: { content: text } }],
+        output_text: text,
+        usage: {
+          prompt_tokens: response.usageMetadata?.promptTokenCount || 0,
+          completion_tokens: response.usageMetadata?.candidatesTokenCount || 0
+        }
+      },
+      provider: 'gemini-fallback',
+      model: GEMINI_FALLBACK_MODEL
+    };
   }
 
   /**
@@ -166,6 +218,7 @@ export class MetaVideoClient {
     if (frames.length === 0) {
       return {
         success: false,
+        provider: 'meta',
         model: this.imageModel,
         durationSec,
         scenes: [],
@@ -175,7 +228,6 @@ export class MetaVideoClient {
       };
     }
 
-    // Select up to 4 representative frames across start, 33%, 66%, and end
     const selectedFrames: ExtractedFrame[] = [];
     if (frames.length <= 4) {
       selectedFrames.push(...frames);
@@ -193,9 +245,10 @@ export class MetaVideoClient {
 
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
+    let usedProvider: AiProviderType = 'meta';
+    let usedModel: string = this.imageModel;
 
     try {
-      // Upload keyframes to Meta Files API if API key is present
       const fileIds: string[] = [];
       if (this.apiKey) {
         for (const frame of selectedFrames) {
@@ -253,7 +306,6 @@ Respond ONLY with valid JSON in this exact structure:
 
       let jsonContent = '';
 
-      // Call Meta Responses API if fileIds are available
       if (this.apiKey && fileIds.length > 0) {
         const inputContent: any[] = fileIds.map(fid => ({
           type: 'input_image',
@@ -281,15 +333,19 @@ Respond ONLY with valid JSON in this exact structure:
           totalInputTokens += data?.usage?.input_tokens || 0;
           totalOutputTokens += data?.usage?.output_tokens || 0;
 
-          // Extract text from responses output
           const messagePart = data.output?.find((o: any) => o.type === 'message')?.content?.find((c: any) => c.type === 'output_text');
           jsonContent = messagePart?.text || '';
+          usedProvider = 'meta';
+          usedModel = this.imageModel;
           console.log(`[MetaVideo] Meta Responses API success. Tokens: in=${totalInputTokens}, out=${totalOutputTokens}`);
         }
       }
 
-      // Gemini Fallback if Meta was unavailable
       if (!jsonContent) {
+        if (isMetaStrict()) {
+          throw new Error('META_STRICT is enabled: Meta Vision analysis failed or META_API_KEY is missing, and Gemini fallback is disabled.');
+        }
+
         console.log('[MetaVideo] Calling Gemini Vision fallback for video scene analysis...');
         const geminiKey = process.env.gemini_api_key1 || process.env.gemini_api_key2 || process.env.GEMINI_API_KEY;
         if (!geminiKey) throw new Error('No AI API key available for video analysis.');
@@ -309,16 +365,17 @@ Respond ONLY with valid JSON in this exact structure:
         parts.push({ text: promptInstructions });
 
         const geminiRes = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
+          model: GEMINI_FALLBACK_MODEL,
           contents: parts,
           config: { responseMimeType: 'application/json' }
         });
         jsonContent = geminiRes.text || '{}';
+        usedProvider = 'gemini-fallback';
+        usedModel = GEMINI_FALLBACK_MODEL;
       }
 
       const parsed = extractJson(jsonContent);
 
-      // Validate and sanitize scenes
       const scenes: SceneAnalysis[] = Array.isArray(parsed.scenes)
         ? parsed.scenes.map((s: any, idx: number) => ({
             id: s.id || `scene-${idx + 1}`,
@@ -342,7 +399,8 @@ Respond ONLY with valid JSON in this exact structure:
 
       return {
         success: true,
-        model: this.imageModel,
+        provider: usedProvider,
+        model: usedModel,
         durationSec,
         scenes,
         summary: parsed.summary || 'Video decomposed into scenes successfully.',
@@ -357,7 +415,8 @@ Respond ONLY with valid JSON in this exact structure:
       console.error('[MetaVideo] analyzeVideoScenes error:', err);
       return {
         success: false,
-        model: this.imageModel,
+        provider: usedProvider,
+        model: usedModel,
         durationSec,
         scenes: [],
         summary: '',
@@ -369,7 +428,7 @@ Respond ONLY with valid JSON in this exact structure:
 
   /**
    * Mode B: Generates dialect-authentic advertising voiceover segments synchronized with video scenes
-   * using Meta Muse Spark.
+   * using Meta Muse Spark (or Gemini fallback when META_STRICT is not enabled).
    */
   async generateAdvertisingVoiceover(params: {
     scenes: SceneAnalysis[];
@@ -382,16 +441,17 @@ Respond ONLY with valid JSON in this exact structure:
   }): Promise<DubbingGenerationResult> {
     const { scenes, durationSec, dialect, platform, tone, voice, userBrief } = params;
 
-    console.log(`[MetaVideo] Meta script generation started. Model: ${this.model}, Dialect: ${dialect}, Platform: ${platform}, Duration: ${Math.round(durationSec)}s, Scenes count: ${scenes.length}`);
+    console.log(`[MetaVideo] Script generation started. Model: ${this.model}, Dialect: ${dialect}, Platform: ${platform}, Duration: ${Math.round(durationSec)}s, Scenes count: ${scenes.length}`);
 
-    if (!this.apiKey) {
-      console.error('[MetaVideo] Meta script generation failed: META_API_KEY is not configured.');
+    if (!this.apiKey && isMetaStrict()) {
+      console.error('[MetaVideo] Script generation failed: META_STRICT is enabled and META_API_KEY is not configured.');
       return {
         success: false,
+        provider: 'meta',
         model: this.model,
         segments: [],
         suggestedTtsSettings: { style: tone, emotion: 'neutral', pace: 'normal' },
-        error: 'META_API_KEY is not configured. Meta Muse Spark is required for script generation.'
+        error: 'META_STRICT is enabled and META_API_KEY is not configured.'
       };
     }
 
@@ -466,10 +526,15 @@ Generate the complete, timestamp-synchronized advertising voiceover script now i
 
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
+    let usedProvider: AiProviderType = 'meta';
+    let usedModel: string = this.model;
 
     try {
-      const data = await this.callMetaChat(messages, 0.4);
-      let content = data?.choices?.[0]?.message?.content || '';
+      const chatRes = await this.callMetaChat(messages, 0.4);
+      usedProvider = chatRes.provider;
+      usedModel = chatRes.model;
+      const data = chatRes.data;
+      const content = data?.choices?.[0]?.message?.content || '';
 
       if (data?.usage) {
         totalInputTokens += data.usage.prompt_tokens || 0;
@@ -478,9 +543,8 @@ Generate the complete, timestamp-synchronized advertising voiceover script now i
 
       let parsed = extractJson(content);
 
-      // If initial JSON parsing failed, attempt ONE single repair pass with Meta Muse Spark
       if (!parsed || !Array.isArray(parsed.segments) || parsed.segments.length === 0) {
-        console.warn('[MetaVideo] Initial Meta output did not parse cleanly. Executing repair pass with Meta Muse Spark...');
+        console.warn('[MetaVideo] Initial output did not parse cleanly. Executing repair pass...');
         const repairMessages = [
           ...messages,
           { role: 'assistant', content: content || '{}' },
@@ -497,7 +561,10 @@ Respond ONLY with valid JSON in this exact format:
           }
         ];
 
-        const repairData = await this.callMetaChat(repairMessages, 0.2);
+        const repairRes = await this.callMetaChat(repairMessages, 0.2);
+        usedProvider = repairRes.provider;
+        usedModel = repairRes.model;
+        const repairData = repairRes.data;
         if (repairData?.usage) {
           totalInputTokens += repairData.usage.prompt_tokens || 0;
           totalOutputTokens += repairData.usage.completion_tokens || 0;
@@ -507,10 +574,9 @@ Respond ONLY with valid JSON in this exact format:
       }
 
       if (!parsed || !Array.isArray(parsed.segments) || parsed.segments.length === 0) {
-        throw new Error('Meta Muse Spark returned no usable voiceover segments.');
+        throw new Error('Model returned no usable voiceover segments.');
       }
 
-      // Sanitize and strictly validate segments against video timeline
       const validSegments: VoiceoverSegment[] = [];
       let previousEnd = 0;
       const safeDuration = Math.max(10, durationSec || 0);
@@ -540,7 +606,6 @@ Respond ONLY with valid JSON in this exact format:
           endTimeSec = safeDuration;
         }
 
-        // Prevent overlap with preceding segment
         if (startTimeSec < previousEnd) {
           startTimeSec = previousEnd;
         }
@@ -567,11 +632,12 @@ Respond ONLY with valid JSON in this exact format:
         throw new Error('No valid voiceover segments could be extracted within the video timeline.');
       }
 
-      console.log(`[MetaVideo] Meta script generation succeeded. Generated ${validSegments.length} segments with model ${this.model}. Token usage: in=${totalInputTokens}, out=${totalOutputTokens}`);
+      console.log(`[MetaVideo] Script generation succeeded via ${usedProvider} (${usedModel}). Generated ${validSegments.length} segments.`);
 
       return {
         success: true,
-        model: this.model,
+        provider: usedProvider,
+        model: usedModel,
         segments: validSegments,
         suggestedTtsSettings: parsed.suggestedTtsSettings || {
           style: tone,
@@ -585,19 +651,20 @@ Respond ONLY with valid JSON in this exact format:
         }
       };
     } catch (err: any) {
-      console.error(`[MetaVideo] Meta script generation failed: ${err.message}`);
+      console.error(`[MetaVideo] Script generation failed: ${err.message}`);
       return {
         success: false,
-        model: this.model,
+        provider: usedProvider,
+        model: usedModel,
         segments: [],
         suggestedTtsSettings: { style: tone, emotion: 'neutral', pace: 'normal' },
-        error: `Meta Muse Spark script generation failed: ${err.message}`
+        error: `Script generation failed: ${err.message}`
       };
     }
   }
 
   /**
-   * Rewrites/regenerates text for a single voiceover segment using Meta Muse Spark.
+   * Rewrites/regenerates text for a single voiceover segment.
    */
   async regenerateSingleSegmentText(params: {
     segmentId: string;
@@ -606,11 +673,17 @@ Respond ONLY with valid JSON in this exact format:
     dialect: string;
     tone: string;
     userBrief?: string;
-  }): Promise<{ success: boolean; text: string; error?: string }> {
-    const { segmentId, sceneDescription, currentText, dialect, tone, userBrief } = params;
+  }): Promise<{ success: boolean; text: string; provider?: AiProviderType; model?: string; error?: string }> {
+    const { sceneDescription, currentText, dialect, tone, userBrief } = params;
 
-    if (!this.apiKey) {
-      return { success: false, text: '', error: 'META_API_KEY is not configured.' };
+    if (!this.apiKey && isMetaStrict()) {
+      return {
+        success: false,
+        text: '',
+        provider: 'meta',
+        model: this.model,
+        error: 'META_STRICT is enabled and META_API_KEY is not configured.'
+      };
     }
 
     const prompt = `You are a world-class advertising scriptwriter specializing in commercial voiceovers.
@@ -629,14 +702,25 @@ Rules:
 
     try {
       const messages = [{ role: 'user', content: prompt }];
-      const res = await this.callMetaChat(messages, 0.5);
-      const text = String(res?.choices?.[0]?.message?.content || '').replace(/^["']|["']$/g, '').trim();
+      const chatRes = await this.callMetaChat(messages, 0.5);
+      const text = String(chatRes.data?.choices?.[0]?.message?.content || '').replace(/^["']|["']$/g, '').trim();
 
-      if (!text) throw new Error('Meta Muse Spark returned empty response.');
-      return { success: true, text };
+      if (!text) throw new Error('Model returned empty response.');
+      return {
+        success: true,
+        text,
+        provider: chatRes.provider,
+        model: chatRes.model
+      };
     } catch (err: any) {
       console.error('[MetaVideo] regenerateSingleSegmentText error:', err);
-      return { success: false, text: '', error: err.message || 'Failed to regenerate segment text.' };
+      return {
+        success: false,
+        text: '',
+        provider: 'meta',
+        model: this.model,
+        error: err.message || 'Failed to regenerate segment text.'
+      };
     }
   }
 
@@ -649,10 +733,13 @@ Rules:
     targetVoice: string;
     durationSec: number;
   }): Promise<VideoLocalizationResult> {
-    const { audioWavPath, targetDialect, targetVoice, durationSec } = params;
+    const { audioWavPath, targetDialect, targetVoice } = params;
 
     try {
-      // Downsample/compress audio to 16kHz mono lightweight WAV to avoid HeadersTimeoutError on large audio buffers
+      if (isMetaStrict() && !this.apiKey) {
+        throw new Error('META_STRICT is enabled and META_API_KEY is not configured.');
+      }
+
       const tempCompressedPath = path.join(path.dirname(audioWavPath), `compressed_transcribe_${Date.now()}.wav`);
       try {
         const { execFile } = await import('node:child_process');
@@ -674,7 +761,6 @@ Rules:
       const buffer = await fs.promises.readFile(activeAudioPath);
       const base64Audio = buffer.toString('base64');
 
-      // Cleanup temp compressed file
       if (fs.existsSync(tempCompressedPath)) {
         fs.promises.unlink(tempCompressedPath).catch(() => {});
       }
@@ -707,7 +793,7 @@ Respond ONLY with valid JSON:
 }`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: GEMINI_FALLBACK_MODEL,
         contents: [
           {
             inlineData: {
@@ -738,6 +824,8 @@ Respond ONLY with valid JSON:
 
       return {
         success: true,
+        provider: 'gemini-fallback',
+        model: GEMINI_FALLBACK_MODEL,
         originalTranscript: Array.isArray(parsed.originalTranscript) ? parsed.originalTranscript : [],
         localizedSegments
       };
@@ -745,6 +833,8 @@ Respond ONLY with valid JSON:
       console.error('[MetaVideo] localizeExistingAudio error:', err);
       return {
         success: false,
+        provider: 'gemini-fallback',
+        model: GEMINI_FALLBACK_MODEL,
         originalTranscript: [],
         localizedSegments: [],
         error: err.message || 'Audio localization failed'
@@ -754,4 +844,3 @@ Respond ONLY with valid JSON:
 }
 
 export const defaultMetaVideoClient = new MetaVideoClient();
-

@@ -1,6 +1,0 @@
-{
-  "summary":  "Comprehensive architectural design and step-by-step implementation plan for the Video Intelligence & Dubbing Studio in DoudouVoice. Covers Mode A (Video Understanding with Meta Muse Spark), Mode B (Advertising Voiceover Generation with Gemini TTS), Mode C (Speech Extraction & Video Localization), FFmpeg audio mixing with configurable ducking and video composition, real-time timeline scrubber UI, and database persistence.",
-  "updatedAt":  "2026-10-31T08:45:24.291714650Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}

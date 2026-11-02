@@ -134,9 +134,12 @@ export default function VideoStudio() {
   const [targetAspectRatio, setTargetAspectRatio] = useState<'9:16' | '1:1' | '16:9' | 'original'>('9:16');
   const [fitMode, setFitMode] = useState<'crop' | 'fit' | 'blur_bg'>('crop');
 
-  // Preview Blob & Authenticated Download State
+  // Preview Blob, Stream Token & Authenticated Download State
   const [previewBlobUrl, setPreviewBlobUrl] = useState<string | null>(null);
   const [isDownloadingFinal, setIsDownloadingFinal] = useState(false);
+  const [streamToken, setStreamToken] = useState<string>('');
+  const [activeProvider, setActiveProvider] = useState<'meta' | 'gemini-fallback'>('meta');
+  const [activeModel, setActiveModel] = useState<string>('');
 
   // Separate loading states for script generation, voiceover generation, text rewrite, and rendering
   const [isGeneratingScript, setIsGeneratingScript] = useState(false);
@@ -181,6 +184,50 @@ export default function VideoStudio() {
   useEffect(() => {
     fetchProjects();
   }, [user]);
+
+  // Fetch and auto-refresh short-lived HMAC stream token for the active project
+  useEffect(() => {
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+
+    const fetchToken = async () => {
+      if (!currentProject?.id || !user) {
+        setStreamToken('');
+        return;
+      }
+      try {
+        const idToken = await user.getIdToken();
+        const res = await fetch(`/api/video/${currentProject.id}/stream-token`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${idToken}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (!cancelled && data.token) {
+            setStreamToken(data.token);
+            const nowSec = Math.floor(Date.now() / 1000);
+            const ttlSec = Math.max(60, (data.exp || nowSec + 600) - nowSec - 60);
+            refreshTimer = setTimeout(fetchToken, ttlSec * 1000);
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to fetch video stream token:', e);
+      }
+    };
+
+    fetchToken();
+
+    return () => {
+      cancelled = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
+    };
+  }, [currentProject?.id, user]);
+
+  const withStreamToken = (url?: string | null) => {
+    if (!url || !streamToken) return '';
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}t=${encodeURIComponent(streamToken)}`;
+  };
 
   // Sync state when project changes
   useEffect(() => {
@@ -278,6 +325,8 @@ export default function VideoStudio() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Video analysis failed');
 
+      if (data.provider) setActiveProvider(data.provider);
+      if (data.model) setActiveModel(data.model);
       setScenes(data.scenes || []);
       setAnalysisSummary(data.summary || '');
       setDetectedTags(data.detectedVisualTags || []);
@@ -318,6 +367,8 @@ export default function VideoStudio() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Script generation failed');
 
+      if (data.provider) setActiveProvider(data.provider);
+      if (data.model) setActiveModel(data.model);
       setSegments(data.segments || []);
       if (data.sfx) {
         setSfxCues(data.sfx);
@@ -408,6 +459,8 @@ export default function VideoStudio() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to rewrite segment text');
 
+      if (data.provider) setActiveProvider(data.provider);
+      if (data.model) setActiveModel(data.model);
       setSegments(prev =>
         prev.map(s => (s.id === segmentId ? { ...s, text: data.text, audioUrl: undefined } : s))
       );
@@ -494,13 +547,13 @@ export default function VideoStudio() {
   useEffect(() => {
     let objectUrl: string | null = null;
     const loadFinalPreviewBlob = async () => {
-      if (!currentProject?.finalVideoUrl || !user) {
+      if (!currentProject?.finalVideoUrl || !user || !streamToken) {
         setPreviewBlobUrl(null);
         return;
       }
       try {
         const idToken = await user.getIdToken();
-        const res = await fetch(currentProject.finalVideoUrl, {
+        const res = await fetch(withStreamToken(currentProject.finalVideoUrl), {
           headers: { Authorization: `Bearer ${idToken}` }
         });
         if (res.ok) {
@@ -523,7 +576,7 @@ export default function VideoStudio() {
     return () => {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [currentProject?.finalVideoUrl, user]);
+  }, [currentProject?.finalVideoUrl, user, streamToken]);
 
   // Authenticated file download handler that guarantees video/mp4 blob delivery without HTML proxy interception
   const handleDownloadFinalVideo = async () => {
@@ -533,7 +586,8 @@ export default function VideoStudio() {
 
     try {
       const idToken = await user.getIdToken();
-      const streamUrl = `/api/video/stream/${currentProject.id}/final?download=true`;
+      const baseStreamUrl = `/api/video/stream/${currentProject.id}/final?download=true`;
+      const streamUrl = streamToken ? `${baseStreamUrl}&t=${encodeURIComponent(streamToken)}` : baseStreamUrl;
       const res = await fetch(streamUrl, {
         headers: { Authorization: `Bearer ${idToken}` }
       });
@@ -665,8 +719,15 @@ export default function VideoStudio() {
               <h1 className="text-base font-bold text-white tracking-wide">
                 {language === 'ar' ? 'استوديو الفيديو والدبلجة الذكية' : 'Video Intelligence & Dubbing Studio'}
               </h1>
-              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#0866FF]/20 text-[#0866FF] border border-[#0866FF]/30">
-                META MUSE SPARK
+              <span
+                className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                  activeProvider === 'gemini-fallback'
+                    ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                    : 'bg-[#0866FF]/20 text-[#0866FF] border-[#0866FF]/30'
+                }`}
+                title={activeModel || undefined}
+              >
+                {activeProvider === 'gemini-fallback' ? 'Gemini fallback' : 'Meta Muse Spark'}
               </span>
             </div>
             <p className="text-xs text-white/50">
@@ -733,17 +794,19 @@ export default function VideoStudio() {
           <div className="relative rounded-2xl overflow-hidden border border-white/10 bg-black flex items-center justify-center aspect-video group shadow-2xl">
             {currentProject ? (
               <>
-                <video
-                  ref={videoRef}
-                  src={currentProject.finalVideoUrl || currentProject.videoUrl}
-                  className="w-full h-full object-contain"
-                  onTimeUpdate={handleTimeUpdate}
-                  onLoadedMetadata={(e) => {
-                    const dur = (e.target as HTMLVideoElement).duration;
-                    if (dur) setVideoDuration(dur);
-                  }}
-                  onEnded={() => setIsPlaying(false)}
-                />
+                {streamToken && (
+                  <video
+                    ref={videoRef}
+                    src={withStreamToken(currentProject.finalVideoUrl || currentProject.videoUrl)}
+                    className="w-full h-full object-contain"
+                    onTimeUpdate={handleTimeUpdate}
+                    onLoadedMetadata={(e) => {
+                      const dur = (e.target as HTMLVideoElement).duration;
+                      if (dur) setVideoDuration(dur);
+                    }}
+                    onEnded={() => setIsPlaying(false)}
+                  />
+                )}
 
                 {/* Subtitle Overlay during live preview */}
                 {subtitlesEnabled && activeSegmentIndex !== null && segments[activeSegmentIndex] && (
@@ -1595,18 +1658,20 @@ export default function VideoStudio() {
 
                   {/* HTML5 Video Preview Player */}
                   <div className="relative rounded-xl overflow-hidden border border-white/20 bg-black aspect-video shadow-2xl group">
-                    <video
-                      key={previewBlobUrl || currentProject.finalVideoUrl}
-                      controls
-                      playsInline
-                      preload="metadata"
-                      src={previewBlobUrl || currentProject.finalVideoUrl}
-                      className="w-full h-full object-contain bg-black"
-                    >
-                      {language === 'ar'
-                        ? 'متصفحك لا يدعم تشغيل الفيديو.'
-                        : 'Your browser does not support HTML5 video playback.'}
-                    </video>
+                    {(previewBlobUrl || streamToken) && (
+                      <video
+                        key={previewBlobUrl || withStreamToken(currentProject.finalVideoUrl)}
+                        controls
+                        playsInline
+                        preload="metadata"
+                        src={previewBlobUrl || withStreamToken(currentProject.finalVideoUrl)}
+                        className="w-full h-full object-contain bg-black"
+                      >
+                        {language === 'ar'
+                          ? 'متصفحك لا يدعم تشغيل الفيديو.'
+                          : 'Your browser does not support HTML5 video playback.'}
+                      </video>
+                    )}
                   </div>
 
                   {/* Authenticated Download Button - DOES NOT AUTO-START, GUARANTEES MP4 BLOB */}

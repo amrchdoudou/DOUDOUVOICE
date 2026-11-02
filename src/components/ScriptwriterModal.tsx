@@ -210,6 +210,8 @@ export default function ScriptwriterModal({
     notice?: string;
   } | null>(null);
   const [usageStats, setUsageStats] = useState<{ totalTokens: number; estimatedCostUsd?: number } | null>(null);
+  const [activeProvider, setActiveProvider] = useState<'meta' | 'gemini-fallback'>('meta');
+  const [activeModel, setActiveModel] = useState<string>('');
 
   // Preload sound script or text if opened from History with initialText
   useEffect(() => {
@@ -311,6 +313,8 @@ export default function ScriptwriterModal({
       setOriginalFacts(data.originalFacts || factsPayload);
       setValidationResult(data.validation || null);
       setUsageStats(data.usage || null);
+      setActiveProvider(data.provider || 'meta');
+      setActiveModel(data.model || '');
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'Script generation failed');
@@ -362,11 +366,15 @@ export default function ScriptwriterModal({
                 <h2 className="text-base font-bold text-white tracking-wide">
                   {t('scriptwriter_title')}
                 </h2>
-                <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-[#0866FF] text-white border border-blue-400/40 shadow-[0_0_10px_rgba(8,102,255,0.4)] font-bold flex items-center gap-1.5">
-                  <svg className="w-3 h-2 text-white fill-current inline-block" viewBox="0 0 24 12" aria-hidden="true">
-                    <path d="M11.996 3.125c-1.89-2.07-4.66-2.92-7.16-2.05-3.37 1.17-4.8 5.43-2.3 8.35 1.83 2.14 4.8 2.8 7.42 1.34l.04-.03.04.03c2.62 1.46 5.59.8 7.42-1.34 2.5-2.92 1.07-7.18-2.3-8.35-2.5-.87-5.27-.02-7.16 2.05z" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
-                  </svg>
-                  Meta muse-spark-1.3
+                <span
+                  className={`text-[10px] uppercase font-mono px-2 py-0.5 rounded-full font-bold flex items-center gap-1.5 border ${
+                    activeProvider === 'gemini-fallback'
+                      ? 'bg-amber-500/20 text-amber-300 border-amber-400/40'
+                      : 'bg-[#0866FF] text-white border-blue-400/40 shadow-[0_0_10px_rgba(8,102,255,0.4)]'
+                  }`}
+                  title={activeModel || undefined}
+                >
+                  {activeProvider === 'gemini-fallback' ? 'Gemini fallback' : 'Meta Muse Spark'}
                 </span>
               </div>
               <p className="text-xs text-white/50">{t('scriptwriter_desc')}</p>

@@ -1,6 +1,6 @@
 /**
  * Meta Model API Client for AI Advertising Scriptwriter
- * Server-side integration with Meta Model API (muse-spark-1.3-contributor)
+ * Server-side integration with Meta Model API
  * Enforces strict two-pass product-fact grounding and validation.
  */
 
@@ -11,8 +11,46 @@ import {
   FactValidationResult,
   FactViolation
 } from './factValidator.js';
+import {
+  getMetaModel,
+  getMetaImageModel,
+  getMetaContributorModel,
+  getMetaReviewerModel,
+  getMetaInspectorModel,
+  isMetaStrict,
+  GEMINI_FALLBACK_MODEL,
+  META_MODEL,
+  META_IMAGE_MODEL,
+  META_CONTRIBUTOR_MODEL,
+  META_REVIEWER_MODEL,
+  META_INSPECTOR_MODEL
+} from './metaConfig.js';
 
 export type { VerifiedProductFacts, FactValidationResult, FactViolation };
+export {
+  getMetaModel,
+  getMetaImageModel,
+  getMetaContributorModel,
+  getMetaReviewerModel,
+  getMetaInspectorModel,
+  isMetaStrict,
+  GEMINI_FALLBACK_MODEL,
+  META_MODEL,
+  META_IMAGE_MODEL,
+  META_CONTRIBUTOR_MODEL,
+  META_REVIEWER_MODEL,
+  META_INSPECTOR_MODEL
+};
+
+export type AiProviderType = 'meta' | 'gemini-fallback';
+
+export interface MetaChatResponse {
+  data: any;
+  provider: AiProviderType;
+  model: string;
+  usage?: any;
+  latencyMs?: number;
+}
 
 export interface ProductImageInput {
   data: string; // base64 string or data URL
@@ -64,6 +102,7 @@ export interface MetaGenerationResult {
     notice?: string;
   };
   usage?: MetaUsage;
+  provider: AiProviderType;
   model: string;
   error?: string;
 }
@@ -178,22 +217,37 @@ function calculateCost(promptTokens: number, completionTokens: number): number {
 }
 
 export class MetaClient {
-  private apiKey: string;
+  private explicitApiKey?: string;
   private baseUrl: string;
-  private model: string;
-  private imageModel: string;
+  private explicitModel?: string;
+  private explicitImageModel?: string;
   private timeoutMs: number;
 
   constructor(options?: { apiKey?: string; baseUrl?: string; model?: string; imageModel?: string; timeoutMs?: number }) {
-    this.apiKey = options?.apiKey !== undefined ? options.apiKey : (process.env.META_API_KEY || '');
+    this.explicitApiKey = options?.apiKey;
     this.baseUrl = (options?.baseUrl || process.env.META_BASE_URL || 'https://api.meta.ai/v1').replace(/\/+$/, '');
-    this.model = options?.model || process.env.META_MODEL || 'muse-spark-1.3-contributor';
-    this.imageModel = options?.imageModel || process.env.META_IMAGE_MODEL || 'muse-spark-1.2-contributor';
+    this.explicitModel = options?.model;
+    this.explicitImageModel = options?.imageModel;
     this.timeoutMs = options?.timeoutMs || 45000;
+  }
+
+  private get apiKey(): string {
+    return this.explicitApiKey !== undefined ? this.explicitApiKey : (process.env.META_API_KEY || '');
+  }
+
+  private get model(): string {
+    return this.explicitModel || getMetaModel();
+  }
+
+  private get imageModel(): string {
+    return this.explicitImageModel || getMetaImageModel();
   }
 
   public isConfigured(): boolean {
     const hasMeta = Boolean(this.apiKey && this.apiKey.trim().length > 0);
+    if (isMetaStrict()) {
+      return hasMeta;
+    }
     const hasGemini = Boolean(
       process.env.gemini_api_key1 ||
       process.env.gemini_api_key2 ||
@@ -226,16 +280,20 @@ export class MetaClient {
     if (!this.isConfigured()) {
       return {
         success: false,
+        provider: 'meta',
         model: this.model,
         originalFacts: sanitizedFacts,
         validation: { passed: false, violations: [], warnings: [], regenerationAttempted: false },
-        error: 'No AI scriptwriter API keys configured in the environment.'
+        error: isMetaStrict()
+          ? 'META_STRICT is enabled and META_API_KEY is not configured. Refusing to fall back to Gemini.'
+          : 'No AI scriptwriter API keys configured in the environment.'
       };
     }
 
     if (!sanitizedFacts.productName || !sanitizedFacts.description) {
       return {
         success: false,
+        provider: 'meta',
         model: this.model,
         originalFacts: sanitizedFacts,
         validation: { passed: false, violations: [], warnings: [], regenerationAttempted: false },
@@ -377,11 +435,12 @@ ${restrictions ? `- Mandatory Restrictions: ${restrictions}` : ''}
 
 Generate the grounded advertising script now as pure JSON.`;
 
-    // Multimodal Image Flow: Meta Files API upload -> Responses API with muse-spark-1.2-contributor
+    // Multimodal Image Flow: Meta Files API upload -> Responses API
     if (input.image) {
       if (!this.apiKey) {
         return {
           success: false,
+          provider: 'meta',
           model: this.imageModel,
           originalFacts: sanitizedFacts,
           validation: { passed: false, violations: [], warnings: [], regenerationAttempted: false },
@@ -470,12 +529,14 @@ Generate the grounded advertising script now as pure JSON.`;
             reasoningTokens: totalReasoningTokens,
             estimatedCostUsd: calculateCost(totalPromptTokens, totalCompletionTokens)
           },
+          provider: 'meta',
           model: response?.model || this.imageModel
         };
       } catch (err: any) {
         console.error('[MetaClient] Multimodal image generation error:', err);
         return {
           success: false,
+          provider: 'meta',
           model: this.imageModel,
           originalFacts: sanitizedFacts,
           validation: { passed: false, violations: [], warnings: [], regenerationAttempted: false },
@@ -484,7 +545,7 @@ Generate the grounded advertising script now as pure JSON.`;
       }
     }
 
-    // Text-Only Flow (Unchanged)
+    // Text-Only Flow
     const messages = [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt }
@@ -496,10 +557,13 @@ Generate the grounded advertising script now as pure JSON.`;
 
     try {
       // First Generation Pass
-      const response = await this.callMetaChat(messages, 0.4);
-      let content = response.choices?.[0]?.message?.content || '';
+      const chatRes = await this.callMetaChat(messages, 0.4);
+      const response = chatRes.data;
+      let activeProvider: AiProviderType = chatRes.provider;
+      let activeModel: string = chatRes.model;
+      let content = response?.choices?.[0]?.message?.content || '';
 
-      if (response.usage) {
+      if (response?.usage) {
         totalPromptTokens += response.usage.prompt_tokens || 0;
         totalCompletionTokens += response.usage.completion_tokens || 0;
         totalReasoningTokens += response.usage.completion_tokens_details?.reasoning_tokens || 0;
@@ -537,14 +601,17 @@ Generate the grounded advertising script now as pure JSON.`;
           }
         ];
 
-        const repairResponse = await this.callMetaChat(repairMessages, 0.2);
-        if (repairResponse.usage) {
+        const repairChatRes = await this.callMetaChat(repairMessages, 0.2);
+        const repairResponse = repairChatRes.data;
+        activeProvider = repairChatRes.provider;
+        activeModel = repairChatRes.model;
+        if (repairResponse?.usage) {
           totalPromptTokens += repairResponse.usage.prompt_tokens || 0;
           totalCompletionTokens += repairResponse.usage.completion_tokens || 0;
           totalReasoningTokens += repairResponse.usage.completion_tokens_details?.reasoning_tokens || 0;
         }
 
-        const repairContent = repairResponse.choices?.[0]?.message?.content || '';
+        const repairContent = repairResponse?.choices?.[0]?.message?.content || '';
         const repairParsed = extractJson(repairContent);
 
         currentScript = {
@@ -587,12 +654,14 @@ Generate the grounded advertising script now as pure JSON.`;
           notice
         },
         usage: usageInfo,
-        model: response.model || this.model
+        provider: activeProvider,
+        model: activeModel
       };
 
     } catch (err: any) {
       return {
         success: false,
+        provider: 'meta',
         model: this.model,
         originalFacts: sanitizedFacts,
         validation: { passed: false, violations: [], warnings: [], regenerationAttempted: false },
@@ -601,50 +670,286 @@ Generate the grounded advertising script now as pure JSON.`;
     }
   }
 
-  public async callMetaChat(messages: Array<{ role: string; content: string }>, temperature = 0.4): Promise<any> {
+  private uploadedFileCache = new Map<string, string>();
+
+  public async callMetaChat(
+    messages: Array<{ role: string; content: string }>,
+    temperature = 0.4,
+    options?: { strictMeta?: boolean; modelOverride?: string; maxRetries?: number }
+  ): Promise<MetaChatResponse> {
+    const strict = Boolean(options?.strictMeta) || isMetaStrict();
+    const targetModel = options?.modelOverride || this.model;
+    const maxRetries = typeof options?.maxRetries === 'number' ? Math.max(0, options.maxRetries) : 2;
+    const startMs = Date.now();
+
     if (!this.apiKey) {
+      if (strict) {
+        throw new Error('META_API_KEY is not configured. Meta AI is required and Gemini fallback is disabled.');
+      }
       return await this.callGeminiFallback(messages, temperature);
     }
+
+    let lastErr: any = null;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+      try {
+        const res = await fetch(`${this.baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: targetModel,
+            messages,
+            temperature
+          }),
+          signal: controller.signal
+        });
+
+        const contentType = res.headers.get('content-type') || '';
+
+        if (!res.ok) {
+          let errorDetail = `HTTP ${res.status}`;
+          try {
+            if (contentType.includes('application/json')) {
+              const errJson = await res.json();
+              errorDetail = errJson?.error?.message || errJson?.error || JSON.stringify(errJson);
+            } else {
+              const errText = await res.text();
+              errorDetail = errText.slice(0, 200) || errorDetail;
+            }
+          } catch (_) {}
+
+          const isTransient = res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504;
+          if (isTransient && attempt < maxRetries) {
+            const retryAfterHeader = res.headers.get('retry-after');
+            const retrySec = retryAfterHeader ? parseFloat(retryAfterHeader) : NaN;
+            const waitMs = Number.isFinite(retrySec) && retrySec > 0
+              ? Math.min(15000, Math.round(retrySec * 1000))
+              : Math.min(10000, 1500 * Math.pow(2, attempt));
+            console.warn(`[MetaClient] Transient HTTP ${res.status} on ${targetModel} (attempt ${attempt + 1}/${maxRetries + 1}). Retrying in ${waitMs}ms...`);
+            await new Promise(r => setTimeout(r, waitMs));
+            continue;
+          }
+
+          if (strict) {
+            throw new Error(`Meta AI chat completion failed (${res.status}): ${errorDetail}`);
+          }
+          console.warn(`[MetaClient] Meta API endpoint returned ${res.status}. Falling back to Gemini...`);
+          return await this.callGeminiFallback(messages, temperature);
+        }
+
+        if (!contentType.includes('application/json')) {
+          if (strict) {
+            throw new Error(`Meta AI API returned non-JSON response (${contentType}).`);
+          }
+          console.warn(`[MetaClient] Meta API returned non-JSON (${contentType}). Falling back to Gemini...`);
+          return await this.callGeminiFallback(messages, temperature);
+        }
+
+        const data = await res.json();
+        return {
+          data,
+          provider: 'meta',
+          model: data?.model || targetModel,
+          usage: data?.usage,
+          latencyMs: Date.now() - startMs
+        };
+      } catch (err: any) {
+        lastErr = err;
+        const isAbortOrNetwork = err?.name === 'AbortError' || /fetch|network|timeout|socket/i.test(err?.message || '');
+        if (isAbortOrNetwork && attempt < maxRetries) {
+          const waitMs = Math.min(8000, 1500 * Math.pow(2, attempt));
+          console.warn(`[MetaClient] Network/timeout error on ${targetModel} (attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}. Retrying in ${waitMs}ms...`);
+          await new Promise(r => setTimeout(r, waitMs));
+          continue;
+        }
+        if (strict) {
+          throw new Error(
+            err.message?.startsWith('Meta AI') || err.message?.includes('META_STRICT') || err.message?.includes('META_API_KEY')
+              ? err.message
+              : `Meta AI request failed: ${err.message}`
+          );
+        }
+        console.warn(`[MetaClient] Meta API request failed: ${err.message}. Falling back to Gemini...`);
+        return await this.callGeminiFallback(messages, temperature);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    throw lastErr || new Error(`Meta AI chat completion failed after ${maxRetries + 1} attempts.`);
+  }
+
+  /**
+   * Uploads a raw image buffer to Meta's Files API (POST https://api.meta.ai/v1/files) with purpose="user_data".
+   * Deduplicates identical buffers in memory so repeated analyses do not re-upload the same bytes.
+   */
+  public async uploadImageBufferToMeta(buffer: Buffer, mimeType = 'image/jpeg', filename = 'asset.jpg'): Promise<string> {
+    if (!this.apiKey) {
+      throw new Error('META_API_KEY is required to upload media to Meta Files API.');
+    }
+    if (!buffer || buffer.length === 0) {
+      throw new Error(`Cannot upload empty buffer for "${filename}" to Meta Files API.`);
+    }
+
+    const { createHash } = await import('node:crypto');
+    const hashKey = `${mimeType}:${buffer.length}:${createHash('sha256').update(buffer).digest('hex')}`;
+    const cachedFileId = this.uploadedFileCache.get(hashKey);
+    if (cachedFileId) {
+      return cachedFileId;
+    }
+
+    const blob = new Blob([buffer], { type: mimeType });
+    const formData = new FormData();
+    formData.append('file', blob, filename);
+    formData.append('purpose', 'user_data');
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
-      const res = await fetch(`${this.baseUrl}/chat/completions`, {
+      const res = await fetch(`${this.baseUrl}/files`, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json'
+          'Authorization': `Bearer ${this.apiKey}`
         },
-        body: JSON.stringify({
-          model: this.model,
-          messages,
-          temperature
-        }),
+        body: formData,
         signal: controller.signal
       });
 
-      if (!res.ok) {
-        console.warn(`[MetaClient] Meta API endpoint returned ${res.status}. Falling back to AI model...`);
-        return await this.callGeminiFallback(messages, temperature);
-      }
-
       const contentType = res.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        console.warn(`[MetaClient] Meta API returned non-JSON (${contentType}). Falling back to AI model...`);
-        return await this.callGeminiFallback(messages, temperature);
+      let data: any = null;
+      if (contentType.includes('application/json')) {
+        data = await res.json();
+      } else {
+        const text = await res.text();
+        throw new Error(`Meta Files API upload failed with status ${res.status}: ${text.slice(0, 200)}`);
       }
 
-      return await res.json();
-    } catch (err: any) {
-      console.warn(`[MetaClient] Meta API request failed: ${err.message}. Falling back to AI model...`);
-      return await this.callGeminiFallback(messages, temperature);
+      if (!res.ok) {
+        throw new Error(`Meta Files API upload failed (${res.status}): ${data?.error?.message || data?.error || JSON.stringify(data)}`);
+      }
+
+      const fileId = data?.id || data?.file_id;
+      if (!fileId) {
+        throw new Error(`Meta Files API returned no file_id in response: ${JSON.stringify(data)}`);
+      }
+
+      this.uploadedFileCache.set(hashKey, fileId);
+      return fileId;
     } finally {
       clearTimeout(timer);
     }
   }
 
-  private async callGeminiFallback(messages: Array<{ role: string; content: string }>, temperature = 0.4): Promise<any> {
+  /**
+   * Calls Meta's Responses API (POST https://api.meta.ai/v1/responses) with one or more uploaded file_ids
+   * as input_image items plus an input_text prompt. Never falls back to Gemini.
+   */
+  public async callMultimodalResponsesApi(
+    fileIds: string[],
+    promptText: string,
+    options?: { modelOverride?: string; maxRetries?: number }
+  ): Promise<{ text: string; model: string; provider: 'meta'; usage?: any; latencyMs?: number }> {
+    if (!this.apiKey) {
+      throw new Error('META_API_KEY is required for Meta AI multimodal vision analysis.');
+    }
+    if (!Array.isArray(fileIds) || fileIds.length === 0) {
+      throw new Error('At least one Meta file_id is required for multimodal vision analysis.');
+    }
+
+    const targetModel = options?.modelOverride || this.imageModel;
+    const maxRetries = typeof options?.maxRetries === 'number' ? Math.max(0, options.maxRetries) : 2;
+    const startMs = Date.now();
+
+    const contentItems: any[] = fileIds.map(fid => ({
+      type: 'input_image',
+      file_id: fid
+    }));
+    contentItems.push({
+      type: 'input_text',
+      text: promptText
+    });
+
+    let lastErr: any = null;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+      try {
+        const res = await fetch(`${this.baseUrl}/responses`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            model: targetModel,
+            input: [
+              {
+                role: 'user',
+                content: contentItems
+              }
+            ]
+          }),
+          signal: controller.signal
+        });
+
+        const contentType = res.headers.get('content-type') || '';
+        let data: any = null;
+        if (contentType.includes('application/json')) {
+          data = await res.json();
+        } else {
+          const text = await res.text();
+          throw new Error(`Meta Responses API returned status ${res.status}: ${text.slice(0, 200)}`);
+        }
+
+        if (!res.ok) {
+          const isTransient = res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504;
+          if (isTransient && attempt < maxRetries) {
+            const retryAfterHeader = res.headers.get('retry-after');
+            const retrySec = retryAfterHeader ? parseFloat(retryAfterHeader) : NaN;
+            const waitMs = Number.isFinite(retrySec) && retrySec > 0
+              ? Math.min(15000, Math.round(retrySec * 1000))
+              : Math.min(10000, 1500 * Math.pow(2, attempt));
+            console.warn(`[MetaClient] Transient HTTP ${res.status} on Responses API (${targetModel}, attempt ${attempt + 1}/${maxRetries + 1}). Retrying in ${waitMs}ms...`);
+            await new Promise(r => setTimeout(r, waitMs));
+            continue;
+          }
+          throw new Error(`Meta Responses API error (${res.status}): ${data?.error?.message || data?.error || JSON.stringify(data)}`);
+        }
+
+        const extractedText = extractResponseContent(data);
+        return {
+          text: extractedText,
+          model: data?.model || targetModel,
+          provider: 'meta',
+          usage: data?.usage,
+          latencyMs: Date.now() - startMs
+        };
+      } catch (err: any) {
+        lastErr = err;
+        const isAbortOrNetwork = err?.name === 'AbortError' || /fetch|network|timeout|socket/i.test(err?.message || '');
+        if (isAbortOrNetwork && attempt < maxRetries) {
+          const waitMs = Math.min(8000, 1500 * Math.pow(2, attempt));
+          console.warn(`[MetaClient] Multimodal Responses API network/timeout (${targetModel}, attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}. Retrying in ${waitMs}ms...`);
+          await new Promise(r => setTimeout(r, waitMs));
+          continue;
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    throw lastErr || new Error(`Meta Responses API failed after ${maxRetries + 1} attempts.`);
+  }
+
+  private async callGeminiFallback(messages: Array<{ role: string; content: string }>, temperature = 0.4): Promise<MetaChatResponse> {
     const geminiKey = process.env.gemini_api_key1 || process.env.gemini_api_key2 || process.env.GEMINI_API_KEY;
     if (!geminiKey) {
       throw new Error('No Gemini or Meta API key is available in the environment.');
@@ -656,7 +961,7 @@ Generate the grounded advertising script now as pure JSON.`;
     const promptText = otherMsgs.map(m => `[${m.role.toUpperCase()}]:\n${m.content}`).join('\n\n');
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: GEMINI_FALLBACK_MODEL,
       contents: promptText,
       config: {
         systemInstruction: systemMsg,
@@ -667,19 +972,23 @@ Generate the grounded advertising script now as pure JSON.`;
 
     const text = response.text || '{}';
     return {
-      choices: [
-        {
-          message: {
-            content: text
+      data: {
+        choices: [
+          {
+            message: {
+              content: text
+            }
           }
+        ],
+        model: GEMINI_FALLBACK_MODEL,
+        usage: {
+          prompt_tokens: 500,
+          completion_tokens: 350,
+          total_tokens: 850
         }
-      ],
-      model: 'muse-spark-1.3-contributor (Meta AI engine)',
-      usage: {
-        prompt_tokens: 500,
-        completion_tokens: 350,
-        total_tokens: 850
-      }
+      },
+      provider: 'gemini-fallback',
+      model: GEMINI_FALLBACK_MODEL
     };
   }
 
@@ -706,51 +1015,7 @@ Generate the grounded advertising script now as pure JSON.`;
     const buffer = Buffer.from(base64, 'base64');
     const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg';
     const filename = image.name || `product-image.${ext}`;
-    const blob = new Blob([buffer], { type: mimeType });
-
-    console.log(`[MetaClient] Uploading product image to Meta Files API: filename="${filename}", mimeType="${mimeType}", bytes=${buffer.length}`);
-
-    const formData = new FormData();
-    formData.append('file', blob, filename);
-    formData.append('purpose', 'user_data');
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-    try {
-      const res = await fetch(`${this.baseUrl}/files`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`
-        },
-        body: formData,
-        signal: controller.signal
-      });
-
-      const contentType = res.headers.get('content-type') || '';
-      let data: any = null;
-      if (contentType.includes('application/json')) {
-        data = await res.json();
-      } else {
-        const text = await res.text();
-        throw new Error(`Meta Files upload failed with status ${res.status}: ${text.slice(0, 200)}`);
-      }
-
-      if (!res.ok) {
-        throw new Error(`Meta Files upload failed (${res.status}): ${data?.error?.message || data?.error || JSON.stringify(data)}`);
-      }
-
-      const fileId = data?.id || data?.file_id;
-      if (!fileId) {
-        throw new Error(`Meta Files API returned no file ID in response: ${JSON.stringify(data)}`);
-      }
-
-      console.log(`[MetaClient] Meta Files upload response: status=${res.status}, id=${fileId}, bytes=${data?.bytes || buffer.length}`);
-      console.log(`[MetaClient] Image upload success: file_id=${fileId}`);
-      return fileId;
-    } finally {
-      clearTimeout(timer);
-    }
+    return await this.uploadImageBufferToMeta(buffer, mimeType, filename);
   }
 
   /**

@@ -58,3 +58,10 @@ export const videoProjects = pgTable('video_projects', {
   createdAt: timestamp('created_at').defaultNow(),
   updatedAt: timestamp('updated_at').defaultNow(),
 });
+
+export const creatorProjects = pgTable('creator_projects', {
+  id: text('id').primaryKey(),
+  uid: text('uid').notNull(),
+  createdAt: timestamp('created_at').defaultNow(),
+});
+

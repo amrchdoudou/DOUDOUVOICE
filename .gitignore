@@ -6,3 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
+audio_cache/
+creator_storage/
+video_storage/
+uploads/
+.aistudio/artifacts/
+/test-*.ts
