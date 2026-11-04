@@ -42,6 +42,9 @@ import {
   reconcileLockedEditingPlanWithSynthesizedVoiceover,
   inspectRenderedVideoWithMuseSpark11,
   repairEditingPlanFromInspection,
+  validateVoiceoverCompleteness,
+  NarrationDurationConflictError,
+  VoiceoverValidationResult,
   CreatorAsset,
   mapCreatorVoiceToGemini,
   FinalVideoInspectionReport
@@ -52,7 +55,13 @@ import {
   getMetaInspectorModel
 } from "./server/metaConfig.js";
 import { synthesizeSegmentWithStudioFallback } from "./server/ttsKeyRotation.js";
-import { executeModalRendering, ensureQuickTimeCompatibleMp4, ModalRenderingResult } from "./server/modalRunner.js";
+import {
+  executeModalRendering,
+  ensureQuickTimeCompatibleMp4,
+  getModalAppConfig,
+  verifyModalAppConnection,
+  ModalRenderingResult
+} from "./server/modalRunner.js";
 
 const FALLBACK_RUNTIME_STREAM_SECRET = crypto
   .createHmac("sha256", "doudouvoice-stream-token-key")
@@ -1980,6 +1989,38 @@ export async function createApp(options?: { skipVite?: boolean }) {
     res.json({ ok: true, ts: Date.now() });
   });
 
+  app.get("/api/creator/modal-status", async (req, res) => {
+    try {
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      const verifyLive = req.query.verify === "true";
+      const cfg = getModalAppConfig();
+      if (verifyLive) {
+        const verified = await verifyModalAppConnection();
+        return res.json({
+          success: true,
+          ...verified,
+          requiredSecrets: ["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"]
+        });
+      }
+      return res.json({
+        success: true,
+        configured: cfg.isConfigured,
+        hasSdkCredentials: cfg.hasSdkCredentials,
+        hasWebhookCredentials: cfg.hasWebhookCredentials,
+        tokenType: cfg.tokenType,
+        tokenFormatWarning: cfg.tokenFormatWarning,
+        appName: cfg.appName,
+        workspace: cfg.workspace,
+        environment: cfg.environment,
+        functionName: cfg.functionName,
+        expectedAppId: cfg.appId,
+        requiredSecrets: ["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"]
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "Failed to check Modal status" });
+    }
+  });
+
   app.post("/api/creator/upload-assets", async (req, res) => {
     try {
       const decoded = await requireUser(req);
@@ -2229,6 +2270,7 @@ export async function createApp(options?: { skipVite?: boolean }) {
       script?: any;
       editingPlan?: any;
       editingPlanReviewSummary?: any;
+      voiceValidation?: any;
       finalInspection?: any;
       repairHistory?: any[];
     };
@@ -2496,6 +2538,7 @@ export async function createApp(options?: { skipVite?: boolean }) {
         videoPath: string;
         editingPlan: any;
         renderResult: ModalRenderingResult;
+        voiceValidation: VoiceoverValidationResult;
         inspectionReport: FinalVideoInspectionReport;
       }> = [];
 
@@ -2504,6 +2547,7 @@ export async function createApp(options?: { skipVite?: boolean }) {
         videoPath: string;
         editingPlan: any;
         renderResult: ModalRenderingResult;
+        voiceValidation: VoiceoverValidationResult;
         inspectionReport: FinalVideoInspectionReport;
       } | null = null;
 
@@ -2528,16 +2572,41 @@ export async function createApp(options?: { skipVite?: boolean }) {
           assets: sanitizedAssets,
           editingPlan: currentEditingPlan,
           masterVoiceoverPath: voiceoverInfo.masterVoiceoverPath,
-          outputFilePath: candidateVideoPath
+          outputFilePath: candidateVideoPath,
+          onProgress: (msg: string) => {
+            jobState.stage = 6;
+            jobState.statusMessage =
+              repairCycle === 0
+                ? `Step 6 (Modal Cloud): ${msg}`
+                : `Step 6 (Repair ${repairCycle}/${maxRepairCycles} • Modal Cloud): ${msg}`;
+            jobState.updatedAt = Date.now();
+            jobState.lastHeartbeatAt = Date.now();
+            persistCreatorJobState(projectDir, jobState);
+          }
         });
+
+        if (renderResult.isConfigurationError) {
+          throw createHttpError(503, renderResult.error || "Modal credentials (MODAL_TOKEN_ID and MODAL_TOKEN_SECRET) are not configured on the server.");
+        }
+
+        if (!renderResult.success && !fs.existsSync(candidateVideoPath)) {
+          throw createHttpError(502, renderResult.error || "Modal FFmpeg rendering failed to produce an output MP4 file.");
+        }
 
         jobState.stage = 7;
         jobState.statusMessage =
           repairCycle === 0
-            ? `Step 7: Inspecting rendered MP4 with ${inspectorModel} & FFprobe technical validation...`
-            : `Step 7 (Repair ${repairCycle}/${maxRepairCycles}): Re-inspecting repaired MP4 with ${inspectorModel}...`;
+            ? `Step 7: Verifying voiceover completeness, FFprobe technical streams & ${inspectorModel} visual inspection...`
+            : `Step 7 (Repair ${repairCycle}/${maxRepairCycles}): Re-verifying repaired MP4 with ${inspectorModel}...`;
         jobState.updatedAt = Date.now();
         persistCreatorJobState(projectDir, jobState);
+
+        const voiceValidation = await validateVoiceoverCompleteness({
+          script,
+          voiceoverInfo,
+          editingPlan: currentEditingPlan,
+          renderedMp4Path: candidateVideoPath
+        });
 
         const inspectionReport = await inspectRenderedVideoWithMuseSpark11({
           videoPath: candidateVideoPath,
@@ -2545,6 +2614,7 @@ export async function createApp(options?: { skipVite?: boolean }) {
           creativeDirection,
           script,
           technicalValidation: renderResult.validation,
+          voiceValidation,
           outputDir: projectDir,
           repairCycle
         });
@@ -2554,6 +2624,7 @@ export async function createApp(options?: { skipVite?: boolean }) {
           videoPath: candidateVideoPath,
           editingPlan: JSON.parse(JSON.stringify(currentEditingPlan)),
           renderResult,
+          voiceValidation,
           inspectionReport
         };
         repairHistory.push(attemptRecord);
@@ -2561,11 +2632,13 @@ export async function createApp(options?: { skipVite?: boolean }) {
         jobState.partial = {
           ...jobState.partial,
           editingPlan: currentEditingPlan,
+          voiceValidation,
           finalInspection: inspectionReport,
           repairHistory: repairHistory.map(r => ({
             repairCycle: r.repairCycle,
             renderedVia: r.renderResult.renderedVia,
             technicalValid: r.renderResult.validation.valid,
+            voiceValid: r.voiceValidation.valid,
             inspectionDecision: r.inspectionReport.decision,
             qualityScore: r.inspectionReport.quality_score,
             detectedIssues: r.inspectionReport.detected_issues
@@ -2574,10 +2647,15 @@ export async function createApp(options?: { skipVite?: boolean }) {
         persistCreatorJobState(projectDir, jobState);
 
         console.log(
-          `[Final Quality Gate] Attempt r${repairCycle}: technicalValid=${renderResult.validation.valid}, inspectionDecision=${inspectionReport.decision}, score=${inspectionReport.quality_score}/100`
+          `[Final Quality Gate] Attempt r${repairCycle}: voiceValid=${voiceValidation.valid}, technicalValid=${renderResult.validation.valid}, inspectionDecision=${inspectionReport.decision}, score=${inspectionReport.quality_score}/100`
         );
 
-        if (renderResult.success && renderResult.validation.valid && inspectionReport.decision === 'PASS') {
+        if (
+          renderResult.success &&
+          renderResult.validation.valid &&
+          voiceValidation.valid &&
+          inspectionReport.decision === 'PASS'
+        ) {
           passedAttempt = attemptRecord;
           break;
         }
@@ -2594,7 +2672,7 @@ export async function createApp(options?: { skipVite?: boolean }) {
             analysis,
             voiceoverInfo,
             assets: sanitizedAssets,
-            targetDurationSec,
+            targetDurationSec: Math.max(targetDurationSec, currentEditingPlan.totalDurationSec || targetDurationSec),
             repairCycle: repairCycle + 1
           });
         }
@@ -2661,6 +2739,7 @@ export async function createApp(options?: { skipVite?: boolean }) {
 
       const isFullyVerified =
         finalReleaseStatus === 'VERIFIED_AND_RELEASED' &&
+        selectedAttempt.voiceValidation.valid &&
         selectedAttempt.renderResult.validation.valid &&
         selectedAttempt.inspectionReport.decision === 'PASS' &&
         editingPlanReviewSummary.finalDecision === 'APPROVED';
@@ -2675,6 +2754,7 @@ export async function createApp(options?: { skipVite?: boolean }) {
         success: true,
         status: 'completed',
         finalReleaseStatus: isFullyVerified ? 'VERIFIED_AND_RELEASED' : 'UNAPPROVED_BEST_AVAILABLE',
+        voiceValidationPassed: selectedAttempt.voiceValidation.valid,
         renderCompleted: true,
         technicalValidationPassed: selectedAttempt.renderResult.validation.valid,
         aiVisualInspectionPassed: selectedAttempt.inspectionReport.decision === 'PASS',
@@ -2692,10 +2772,12 @@ export async function createApp(options?: { skipVite?: boolean }) {
         finalVideoUrl,
         renderedVia: selectedAttempt.renderResult.renderedVia,
         isModalFallback: selectedAttempt.renderResult.isModalFallback,
+        modalAppInfo: selectedAttempt.renderResult.modalAppInfo,
         hasAudioInputSupplied: selectedAttempt.renderResult.hasAudioInputSupplied,
         videoOnly: selectedAttempt.renderResult.videoOnly,
         durationSec: selectedAttempt.renderResult.durationSec,
         fileSizeBytes: selectedAttempt.renderResult.fileSizeBytes,
+        voiceValidation: selectedAttempt.voiceValidation,
         validation: selectedAttempt.renderResult.validation,
         analysis,
         creativeDirection,
@@ -2709,6 +2791,7 @@ export async function createApp(options?: { skipVite?: boolean }) {
           repairCycle: r.repairCycle,
           renderedVia: r.renderResult.renderedVia,
           technicalValid: r.renderResult.validation.valid,
+          voiceValid: r.voiceValidation.valid,
           inspectionDecision: r.inspectionReport.decision,
           qualityScore: r.inspectionReport.quality_score,
           detectedIssues: r.inspectionReport.detected_issues,
@@ -2735,7 +2818,9 @@ export async function createApp(options?: { skipVite?: boolean }) {
       const httpStatus =
         err instanceof HttpError
           ? err.status
-          : typeof err?.message === "string" && (err.message.includes("META_STRICT") || err.message.includes("META_API_KEY"))
+          : err instanceof NarrationDurationConflictError || err?.name === "NarrationDurationConflictError"
+          ? 400
+          : typeof err?.message === "string" && (err.message.includes("META_STRICT") || err.message.includes("META_API_KEY") || err.message.includes("MODAL_TOKEN"))
           ? 503
           : 500;
       jobState.status = 'failed';
@@ -2748,6 +2833,23 @@ export async function createApp(options?: { skipVite?: boolean }) {
       clearInterval(heartbeatTimer);
       activeInMemoryJobIds.delete(projectId);
       releaseSlot();
+      // Cleanup temporary intermediate files while preserving final_creator_video.mp4, assets, and audio segments
+      try {
+        if (fs.existsSync(projectDir)) {
+          const entries = fs.readdirSync(projectDir);
+          for (const entry of entries) {
+            if (
+              entry.startsWith("prepared_scene_") ||
+              entry.startsWith("tier3_keyframe_") ||
+              entry === "mastered_video.mp4" ||
+              entry.startsWith("inspect_frames_r") ||
+              entry.startsWith("final_creator_video_repair_")
+            ) {
+              fs.rmSync(path.join(projectDir, entry), { recursive: true, force: true });
+            }
+          }
+        }
+      } catch (_) {}
     }
   };
 

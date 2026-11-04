@@ -233,13 +233,13 @@ export async function synthesizeSegmentWithStudioFallback(
       const isRecoverable = isKeySpecificError(err);
       if (isPermanentKeyError(err) && allApiKeys.length > 1) {
         disabledKeyNames.add(keyObj.name);
-        console.warn(`[TTS Engine] Key "${keyObj.name}" returned permanent auth/permission error (401/403); marking disabled for session.`);
+        console.log(`[TTS Engine] Key "${keyObj.name}" unavailable for session; rotating to next active key in pool.`);
       } else {
-        console.warn(`[TTS Engine] Key "${keyObj.name}" failed for segment ${segment.id}: ${err.message || err}`);
+        console.log(`[TTS Engine] Key "${keyObj.name}" encountered transient issue for segment ${segment.id}; rotating key...`);
       }
 
       if (isRecoverable && attempt < apiKeys.length - 1) {
-        console.warn(`[TTS Engine] Switching to next available key in rotation pool...`);
+        console.log(`[TTS Engine] Switching to next available key in rotation pool...`);
         sharedKeyIndex = (keyIdx + 1) % apiKeys.length;
         await new Promise(r => setTimeout(r, 600)); // Brief pause before trying next key
         continue;

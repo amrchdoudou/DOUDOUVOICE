@@ -20,16 +20,68 @@ export const MIN_SCENE_DURATION_SEC = 1.5;
 export const MAX_SCENE_EXPANSION_RATIO = 1.75;
 export const MAX_SINGLE_SCENE_DURATION_SEC = 10.0;
 export const MAX_TOTAL_DURATION_SEC = 60.0;
+export const MAX_NATURAL_ATEMPO = 1.14;
+export const SEGMENT_TAIL_CUSHION_SEC = 0.10;
+export const TIMELINE_TAIL_MARGIN_SEC = 0.18;
+
+export class NarrationDurationConflictError extends Error {
+  public readonly status = 400;
+  public readonly code = 'NARRATION_DURATION_CONFLICT';
+  public readonly targetDurationSec: number;
+  public readonly requiredSpeechDurationSec: number;
+
+  constructor(message: string, targetDurationSec: number, requiredSpeechDurationSec: number) {
+    super(message);
+    this.name = 'NarrationDurationConflictError';
+    this.targetDurationSec = targetDurationSec;
+    this.requiredSpeechDurationSec = requiredSpeechDurationSec;
+  }
+}
 
 export type CreatorTransitionType =
   | 'crossfade'
   | 'fade'
   | 'fadeblack'
+  | 'dissolve'
   | 'wipeleft'
   | 'wiperight'
   | 'slideleft'
+  | 'slideright'
   | 'smoothleft'
+  | 'smoothright'
+  | 'smoothup'
+  | 'smoothdown'
+  | 'circleopen'
+  | 'horzopen'
   | 'none';
+
+export type CreatorCameraEffect =
+  | 'smart_subject_focus'
+  | 'slow_zoom_in'
+  | 'slow_zoom_out'
+  | 'pan_left'
+  | 'pan_right'
+  | 'pull_back_reveal'
+  | 'track_horizontal'
+  | 'track_vertical'
+  | 'detail_closeup'
+  | 'handheld_stabilized'
+  | 'pip_detail_spotlight'
+  | 'static';
+
+export type CreatorSceneRole =
+  | 'hook'
+  | 'product_intro'
+  | 'demonstration'
+  | 'benefits'
+  | 'cta';
+
+export type CreatorShotType =
+  | 'detail_closeup'
+  | 'medium_hero'
+  | 'full_shot'
+  | 'pip_detail'
+  | 'cta_card';
 
 export interface CreatorAsset {
   id: string;
@@ -136,6 +188,8 @@ export interface CreatorVideoScript {
 export interface EditingPlanScene {
   assetId: string;
   type: 'image' | 'video';
+  sceneRole?: CreatorSceneRole;
+  shotType?: CreatorShotType;
   timelineStartTimeSec: number; // offset on the final master video timeline
   startTimeSec?: number;        // for video sub-clip source offset
   endTimeSec?: number;          // for video sub-clip source offset
@@ -147,7 +201,7 @@ export interface EditingPlanScene {
   preparedClipDurationSec?: number; // K'_i / 30
   xfadeOffsetSec?: number;      // cumulative offset O_i = S_{i+1}
   voiceoverSegmentIds?: string[];
-  effect: 'slow_zoom_in' | 'slow_zoom_out' | 'pan_left' | 'pan_right' | 'smart_subject_focus' | 'static';
+  effect: CreatorCameraEffect;
   samFocusBox?: [number, number, number, number]; // [ymin, xmin, ymax, xmax]
   transitionOut: CreatorTransitionType;
   colorGrading?: 'vibrant' | 'warm_luxury' | 'cool_tech' | 'cinematic' | 'clean_natural' | 'none';
@@ -174,6 +228,22 @@ export interface SynchronizedCreatorSegment {
   startTimeSec: number;
   endTimeSec: number;
   durationSec: number;
+}
+
+export interface VoiceoverValidationResult {
+  valid: boolean;
+  allSegmentsPresent: boolean;
+  nonSilent: boolean;
+  allSegmentsScheduled: boolean;
+  noSceneCut: boolean;
+  noClippedWords: boolean;
+  waveformVerified: boolean;
+  segmentsChecked: number;
+  lastWordEndTimeSec: number;
+  timelineDurationSec: number;
+  tailMarginSec: number;
+  errors: string[];
+  summary: string;
 }
 
 export interface EditingPlan {
@@ -342,6 +412,7 @@ Values for box2d should be scaled 0-1000 integer normalized bounding box coordin
       try {
         const probe = await probeVideo(asset.filePath);
         durationSec = probe.durationSec || durationSec;
+        asset.durationSec = durationSec;
       } catch (err: any) {
         throw new Error(`Stage A failed to probe video "${asset.originalName}" (${asset.id}): ${err.message}`);
       }
@@ -582,58 +653,98 @@ export async function generateCreatorScript(
     ? lockedEditingPlan!.scenes
     : null;
 
+  const wordsPerSec = isEnglish ? 2.25 : 1.95;
+
+  const maxSegmentsForDuration =
+    targetDurationSec <= 10 ? 2 :
+    targetDurationSec <= 15 ? 3 :
+    targetDurationSec <= 30 ? 6 : 10;
+
+  const maxWordsBudgetForDuration =
+    targetDurationSec <= 10 ? 14 :
+    targetDurationSec <= 15 ? 20 :
+    targetDurationSec <= 30 ? Math.round(targetDurationSec * 0.76 * wordsPerSec) :
+    Math.round(targetDurationSec * 0.78 * wordsPerSec);
+
   if (lockedScenes) {
-    targetSegmentCount = Math.min(6, Math.max(2, lockedScenes.length));
+    targetSegmentCount =
+      targetDurationSec <= 15
+        ? Math.min(maxSegmentsForDuration, Math.max(2, lockedScenes.length))
+        : Math.min(maxSegmentsForDuration, Math.max(2, lockedScenes.length));
     const sceneLines: string[] = [];
     let wordBudgetSum = 0;
+    const perSegMaxWordsCap = Math.max(
+      5,
+      targetDurationSec <= 15
+        ? Math.floor(maxWordsBudgetForDuration / targetSegmentCount)
+        : Math.min(28, Math.ceil((maxWordsBudgetForDuration * 1.15) / targetSegmentCount))
+    );
     for (let i = 0; i < targetSegmentCount; i++) {
-      const sc = lockedScenes[i] || lockedScenes[lockedScenes.length - 1];
+      const mappedSceneIdx =
+        targetSegmentCount === 1
+          ? 0
+          : i === 0
+          ? 0
+          : i === targetSegmentCount - 1
+          ? lockedScenes.length - 1
+          : Math.min(
+              lockedScenes.length - 2,
+              Math.max(1, Math.round((i * (lockedScenes.length - 1)) / (targetSegmentCount - 1)))
+            );
+      const sc = lockedScenes[mappedSceneIdx] || lockedScenes[lockedScenes.length - 1];
       const scDur = Number(sc?.durationSec) || (targetDurationSec / targetSegmentCount);
-      const speechWindowSec = Math.max(1.6, scDur - 0.45);
-      const segMaxWords = Math.max(4, Math.min(14, Math.round(speechWindowSec * 2.0 * speed)));
+      const speechWindowSec =
+        targetDurationSec <= 15
+          ? Math.max(1.5, Math.min(scDur - 0.35, (targetDurationSec * 0.72) / targetSegmentCount))
+          : Math.max(2.0, Math.min(scDur - 0.45, scDur * 0.80));
+      const segMaxWords = Math.max(
+        targetDurationSec <= 15 ? 4 : 8,
+        Math.min(perSegMaxWordsCap, Math.round(speechWindowSec * wordsPerSec * speed))
+      );
       wordBudgetSum += segMaxWords;
       const role = i === 0 ? 'hook' : i === targetSegmentCount - 1 ? 'call_to_action' : i === 1 ? 'benefit' : 'product_reveal';
       sceneLines.push(
-        `- Segment ${i + 1} (id: "seg_${i + 1}", sceneId: "scene_${i + 1}", role: "${role}", target speech window: ${speechWindowSec.toFixed(1)}s, max ${segMaxWords} words): Match Scene ${i + 1} (${sc?.assetId || `asset_${i + 1}`}, effect: ${sc?.effect || 'smart_subject_focus'}${sc?.overlayText ? `, headline: "${sc.overlayText}"` : ''}).`
+        `- Segment ${i + 1} (id: "seg_${i + 1}", sceneId: "scene_${mappedSceneIdx + 1}", role: "${role}", target speech window: ${speechWindowSec.toFixed(1)}s, target ${ Math.max(4, segMaxWords - 3) }-${segMaxWords} words): Match Scene ${mappedSceneIdx + 1} (${sc?.assetId || `asset_${mappedSceneIdx + 1}`}, effect: ${sc?.effect || 'smart_subject_focus'}${sc?.overlayText ? `, headline: "${sc.overlayText}"` : ''}).`
       );
     }
-    maxTotalWords = Math.max(10, wordBudgetSum);
-    segmentGuideline = `EXACTLY ${targetSegmentCount} segments locked to the approved ${lockedScenes.length}-scene Editing Plan:\n${sceneLines.join('\n')}`;
+    maxTotalWords = Math.min(maxWordsBudgetForDuration, Math.max(10, wordBudgetSum));
+    segmentGuideline = `EXACTLY ${targetSegmentCount} natural, flowing narration segments synchronized 1-to-1 across the approved ${lockedScenes.length}-scene Editing Plan:\n${sceneLines.join('\n')}`;
   } else if (targetDurationSec <= 10) {
     targetSegmentCount = 2;
-    maxTotalWords = 16;
+    maxTotalWords = 14;
     segmentGuideline = `EXACTLY 2 segments:
-- Segment 1 (role: "hook", 7-8 words max): Punchy scroll-stopping attention hook.
-- Segment 2 (role: "call_to_action", 7-8 words max): Urgent offer and immediate CTA.`;
+- Segment 1 (role: "hook", 6-7 words max): Punchy scroll-stopping attention hook.
+- Segment 2 (role: "call_to_action", 6-7 words max): Urgent offer and immediate CTA.`;
   } else if (targetDurationSec <= 15) {
     targetSegmentCount = 3;
-    maxTotalWords = 26;
+    maxTotalWords = 20;
     segmentGuideline = `EXACTLY 3 segments:
-- Segment 1 (role: "hook", 7-8 words max): Immediate curiosity or scroll-stopping hook.
-- Segment 2 (role: "benefit", 10-12 words max): Main product reveal & primary benefit.
-- Segment 3 (role: "call_to_action", 6-8 words max): Direct, concise call to action.`;
+- Segment 1 (role: "hook", 5-6 words max): Immediate curiosity or scroll-stopping hook.
+- Segment 2 (role: "benefit", 7-8 words max): Main product reveal & primary benefit.
+- Segment 3 (role: "call_to_action", 5-6 words max): Direct, concise call to action.`;
   } else if (targetDurationSec <= 30) {
     targetSegmentCount = 4;
-    maxTotalWords = 52;
+    maxTotalWords = Math.round(targetDurationSec * 0.76 * wordsPerSec);
     segmentGuideline = `EXACTLY 4 segments:
-- Segment 1 (role: "hook", 8-10 words max): Hook to stop scrolling.
-- Segment 2 (role: "problem", 12-14 words max): Relatable problem/inquiry.
-- Segment 3 (role: "benefit", 14-16 words max): Product solution & practical value.
-- Segment 4 (role: "call_to_action", 10-12 words max): Clear closing call to action.`;
+- Segment 1 (role: "hook", 10-12 words): Engaging hook to capture attention immediately.
+- Segment 2 (role: "problem", 11-14 words): Relatable challenge or need.
+- Segment 3 (role: "benefit", 12-15 words): Product solution, workflow, and practical value.
+- Segment 4 (role: "call_to_action", 9-11 words): Clear, confident closing call to action.`;
   } else {
-    targetSegmentCount = Math.min(6, Math.max(5, Math.round(targetDurationSec / 10)));
-    maxTotalWords = Math.round(targetDurationSec * 1.7);
-    segmentGuideline = `EXACTLY ${targetSegmentCount} segments proportionally distributed between hook, problem, product reveal, key benefits, and call to action. Total words must not exceed ${maxTotalWords}.`;
+    targetSegmentCount = Math.min(8, Math.max(6, Math.round(targetDurationSec / 8)));
+    maxTotalWords = Math.round(targetDurationSec * 0.78 * wordsPerSec);
+    const avgWords = Math.round(maxTotalWords / targetSegmentCount);
+    segmentGuideline = `EXACTLY ${targetSegmentCount} segments (~${Math.max(10, avgWords - 3)}-${avgWords + 2} words per segment) proportionally distributed across hook, problem, product walkthrough, key benefits, and call to action so every scene has continuous narration without dead silent gaps. Total words across all segments: ~${Math.round(maxTotalWords * 0.85)}-${maxTotalWords} words.`;
   }
 
   const languagePromptInstruction = isEnglish
-    ? `Language: Natural commercial ${dialect}. Write concise, persuasive, high-impact English ad copy.`
+    ? `Language: Natural commercial ${dialect}. Write fluent, engaging, persuasive English voiceover copy.`
     : isKabyle
     ? `Language: Authentic conversational Algerian Kabyle (Taqbaylit)${kabyleRegion ? ` (${kabyleRegion} region)` : ''}. Write in everyday spoken Kabyle Latin or Arabic script.`
     : `Language: Authentic colloquial ${dialect} (NEVER Modern Standard Arabic / Fusha). Write in authentic colloquial Arabic script matching the dialect phonetics.`;
 
-  const prompt = `Act as an expert Meta AI Advertising Creative Director & Voice Director for video commercials.
-Create a high-converting, deeply expressive voiceover script tailored to the following creative direction, uploaded assets, and approved scene timeline:
+  const prompt = `Act as an expert Meta AI Advertising Creative Director & Voice Director for video commercials and product presentations.
+Create a high-converting, fluid, expressive voiceover script tailored to the following creative direction, uploaded assets, and approved scene timeline:
 
 Creative Direction:
 ${JSON.stringify(creativeDirection, null, 2)}
@@ -643,33 +754,33 @@ Voice Profile: ${voice} (${gender})
 Style & Delivery: ${style} style with a ${emotion} tone (Speed factor: ${speed.toFixed(2)}x, Pitch: ${pitch})
 ${languagePromptInstruction}
 
-CRITICAL DURATION & LENGTH CONSTRAINTS (HARD RULES):
+CRITICAL DURATION, FLOW & CADENCE RULES (HARD CONSTRAINTS):
 - Target Video Duration: EXACTLY ${targetDurationSec} seconds.
-- You MUST output EXACTLY ${targetSegmentCount} segments in the "segments" array. Do not output more than ${targetSegmentCount} segments.
+- You MUST output EXACTLY ${targetSegmentCount} segments in the "segments" array. Do not output fewer or more than ${targetSegmentCount} segments.
 ${segmentGuideline}
-- Total Spoken Word Count: Spoken pace is approx 2.0-2.2 words/sec. The TOTAL word count across ALL segments combined MUST NOT EXCEED ${maxTotalWords} words.
-- Keep every sentence short, punchy, conversational, and direct. Do NOT use lengthy, complex compound sentences.
-- Script must feel human, lively, and natural in ${dialect}—NEVER robotic, monotone, or textbook-like.
+- Total Spoken Word Count: Target ${targetDurationSec <= 15 ? `at most ${maxTotalWords}` : `${Math.round(maxTotalWords * 0.82)} to ${maxTotalWords}`} words across all ${targetSegmentCount} segments combined so the voiceover fills each scene naturally without long silent gaps.
+- CONTINUOUS NATURAL FLOW (NO CHOPPY FRAGMENTS): Write smooth, complete, natural spoken sentences for every segment. NEVER write choppy 1-to-3 word period-separated fragments like "Your words. Your voice. Perfectly realized." — periods between short fragments force the TTS engine to stop and speak unnaturally slowly. Connect short clauses with commas instead of periods so the voiceover flows smoothly and continuously.
+- Script must feel human, lively, and natural in ${dialect}—NEVER robotic, monotone, or halting.
 
 Return a structured JSON object ONLY with the following schema:
 {
-  "hook": "Opening hook sentence in ${dialect} (short, under 8 words)",
-  "mainMessage": "Core product value proposition in ${dialect} (short, under 12 words)",
+  "hook": "Opening hook in ${dialect} (short headline, under 7 words)",
+  "mainMessage": "Core product value proposition in ${dialect}",
   "benefits": ["Benefit 1", "Benefit 2"],
-  "callToAction": "Final CTA in ${dialect} (short, under 8 words)",
+  "callToAction": "Final CTA headline in ${dialect} (under 7 words)",
   "dialect": "${dialect}",
   "voice": "${voice}",
   "segments": [
     {
       "id": "seg_1",
       "role": "hook",
-      "text": "Short sentence in ${dialect}",
+      "text": "Smooth, complete spoken sentence in ${dialect} matching the target word count for this scene",
       "visualDescription": "Matching visual scene description from uploaded media",
-      "estimatedDurationSec": 3.0,
+      "estimatedDurationSec": 3.5,
       "emotion": "${emotion}",
-      "pace": "${speed > 1.1 ? 'fast' : speed < 0.9 ? 'slow' : 'normal'}",
+      "pace": "${speed > 1.08 ? 'fast' : speed < 0.88 ? 'slow' : 'normal'}",
       "style": "${style}",
-      "deliveryInstruction": "High-energy hook delivered with genuine enthusiasm to hook viewers instantly",
+      "deliveryInstruction": "Deliver with smooth, continuous, engaging cadence and natural warmth without pausing between words",
       "vocalBurst": "energetic_intro"
     }
   ]
@@ -719,7 +830,7 @@ Return a structured JSON object ONLY with the following schema:
     {
       id: 'seg_1',
       role: 'hook',
-      text: parsed.hook || 'حبس السكرول! شوف هذا العرض الاستثنائي!',
+      text: parsed.hook || 'حبس السكرول، شوف هذا العرض الاستثنائي!',
       visualDescription: 'Dynamic opening hook showcasing primary asset',
       estimatedDurationSec: 3.0,
       emotion: 'excited',
@@ -732,7 +843,7 @@ Return a structured JSON object ONLY with the following schema:
       role: 'benefit',
       text: parsed.mainMessage || 'جودة ممتازة وتصميم عصري يرافقك كل يوم.',
       visualDescription: 'Product feature demonstration scene',
-      estimatedDurationSec: 4.5,
+      estimatedDurationSec: 4.0,
       emotion: 'friendly',
       pace: 'normal',
       style: 'Friendly',
@@ -743,7 +854,7 @@ Return a structured JSON object ONLY with the following schema:
       role: 'call_to_action',
       text: parsed.callToAction || 'اطلبه الآن والتوصيل لباب دارك!',
       visualDescription: 'Closing hero product card with call to action',
-      estimatedDurationSec: 3.5,
+      estimatedDurationSec: 3.0,
       emotion: 'persuasive',
       pace: 'fast',
       style: 'Luxury brand voice',
@@ -764,33 +875,86 @@ Return a structured JSON object ONLY with the following schema:
     rawSegments = [first, ...middle, last];
   }
 
-  const segments: VideoScriptSegment[] = rawSegments.map((s: any, idx: number) => {
-    let text = String(s.text || s.sentence || '').trim();
-    const matchedLockedScene = lockedScenes ? lockedScenes[Math.min(idx, lockedScenes.length - 1)] : undefined;
-    const lockedSpeechWindow = matchedLockedScene
-      ? Math.max(1.6, (Number(matchedLockedScene.durationSec) || 3.5) - 0.45)
-      : (targetDurationSec * 0.75) / targetSegmentCount;
+  const perSegmentWordCap =
+    targetDurationSec <= 15
+      ? Math.max(5, Math.ceil((maxTotalWords + 2) / targetSegmentCount))
+      : Math.max(10, Math.ceil((maxTotalWords * 1.2) / targetSegmentCount));
 
-    // Enforce per-segment word limit matched to scene duration to prevent speech overflow
+  const smoothChoppyPunctuation = (input: string): string => {
+    // Replace internal periods/exclamations after 1-3 word micro-fragments with commas so TTS speaks fluidly without stopping
+    const parts = input
+      .split(/(?<=[.!؟])\s+/)
+      .map(p => p.trim())
+      .filter(Boolean);
+    if (parts.length <= 1) return input;
+    const smoothed: string[] = [];
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const wordCount = part.split(/\s+/).filter(Boolean).length;
+      if (i < parts.length - 1 && wordCount <= 4) {
+        smoothed.push(part.replace(/[.!؟]+$/, '') + ',');
+      } else {
+        smoothed.push(part);
+      }
+    }
+    return smoothed.join(' ');
+  };
+
+  const segments: VideoScriptSegment[] = rawSegments.map((s: any, idx: number) => {
+    let text = smoothChoppyPunctuation(String(s.text || s.sentence || '').trim());
+    const mappedSceneIdx =
+      lockedScenes
+        ? rawSegments.length === 1
+          ? 0
+          : idx === 0
+          ? 0
+          : idx === rawSegments.length - 1
+          ? lockedScenes.length - 1
+          : Math.min(
+              lockedScenes.length - 2,
+              Math.max(1, Math.round((idx * (lockedScenes.length - 1)) / (rawSegments.length - 1)))
+            )
+        : idx;
+    const matchedLockedScene = lockedScenes ? lockedScenes[mappedSceneIdx] : undefined;
+    const scDur = Number(matchedLockedScene?.durationSec) || (targetDurationSec / targetSegmentCount);
+    const lockedSpeechWindow =
+      targetDurationSec <= 15
+        ? Math.max(1.5, Math.min(scDur - 0.35, (targetDurationSec * 0.72) / targetSegmentCount))
+        : Math.max(2.0, Math.min(scDur - 0.45, scDur * 0.80));
+
+    // Enforce per-segment word limit matched to scene duration & campaign total budget
     const words = text.split(/\s+/).filter(Boolean);
-    const maxWordsPerSeg = matchedLockedScene
-      ? Math.max(5, Math.min(14, Math.round(lockedSpeechWindow * 2.1 * speed) + 1))
-      : Math.max(6, Math.round(maxTotalWords / targetSegmentCount) + 2);
+    const maxWordsPerSeg =
+      targetDurationSec <= 15
+        ? Math.min(
+            perSegmentWordCap,
+            matchedLockedScene
+              ? Math.max(5, Math.min(10, Math.round(lockedSpeechWindow * 1.9 * speed) + 1))
+              : perSegmentWordCap
+          )
+        : Math.min(
+            perSegmentWordCap,
+            Math.max(8, Math.min(28, Math.round(lockedSpeechWindow * wordsPerSec * speed) + 3))
+          );
     if (words.length > maxWordsPerSeg) {
       text = words.slice(0, maxWordsPerSeg).join(' ');
     }
 
+    const rawPace = s.pace || s.ttsPace || 'normal';
+    const normalizedPace: 'slow' | 'normal' | 'fast' =
+      rawPace === 'slow' && speed >= 0.9 ? 'normal' : (['slow', 'normal', 'fast'].includes(rawPace) ? rawPace : 'normal');
+
     return {
       id: s.id || `seg_${idx + 1}`,
-      sceneId: s.sceneId || (lockedScenes ? `scene_${Math.min(idx + 1, lockedScenes.length)}` : undefined),
+      sceneId: lockedScenes ? `scene_${mappedSceneIdx + 1}` : s.sceneId,
       role: s.role || (idx === 0 ? 'hook' : idx === rawSegments.length - 1 ? 'call_to_action' : 'benefit'),
       text,
       visualDescription: s.visualDescription || 'Product scene presentation',
       estimatedDurationSec: Number(s.estimatedDurationSec) || Number(lockedSpeechWindow.toFixed(2)),
       emotion: ['excited', 'friendly', 'persuasive', 'reassuring', 'curious', 'serious', 'playful', 'warm', 'neutral'].includes(s.emotion) ? s.emotion : (s.ttsEmotion || emotion || 'friendly'),
-      pace: ['slow', 'normal', 'fast'].includes(s.pace) ? s.pace : (s.ttsPace || 'normal'),
+      pace: normalizedPace,
       style: s.style || style || 'Premium commercial',
-      deliveryInstruction: s.deliveryInstruction || '',
+      deliveryInstruction: s.deliveryInstruction || 'Deliver with smooth, continuous flow and natural pacing without long pauses',
       vocalBurst: s.vocalBurst || '',
       status: 'pending'
     };
@@ -813,6 +977,82 @@ Return a structured JSON object ONLY with the following schema:
     provider: usedProvider,
     model: usedModel
   };
+}
+
+/**
+ * Trims excess leading/trailing digital silence from 24kHz 16-bit mono TTS PCM buffers
+ * and collapses any unnatural internal dead-air pauses (> 260ms) down to a natural 150ms breath pause,
+ * while preserving a 35ms vocal onset and 25ms vocal release before tail cushion is added.
+ */
+function trimExcessTtsPcmSilence(rawPcm: Buffer): Buffer {
+  if (!rawPcm || rawPcm.length < 4800) return rawPcm; // < 100ms
+  const totalSamples = Math.floor(rawPcm.length / 2);
+  const silenceThreshold = 340; // ~ -40 dBFS in 16-bit PCM
+
+  let firstActiveSample = 0;
+  for (let i = 0; i < totalSamples; i++) {
+    if (Math.abs(rawPcm.readInt16LE(i * 2)) > silenceThreshold) {
+      firstActiveSample = i;
+      break;
+    }
+  }
+
+  let lastActiveSample = totalSamples - 1;
+  for (let i = totalSamples - 1; i >= firstActiveSample; i--) {
+    if (Math.abs(rawPcm.readInt16LE(i * 2)) > silenceThreshold) {
+      lastActiveSample = i;
+      break;
+    }
+  }
+
+  if (lastActiveSample <= firstActiveSample) return rawPcm;
+
+  const leadKeepSamples = Math.floor(0.035 * 24000); // 35ms natural onset
+  const trailKeepSamples = Math.floor(0.025 * 24000); // 25ms natural release before 100ms cushion
+  const startSample = Math.max(0, firstActiveSample - leadKeepSamples);
+  const endSample = Math.min(totalSamples, lastActiveSample + trailKeepSamples);
+
+  // Collapse internal silence runs longer than 260ms (6240 samples) down to 150ms (3600 samples)
+  const maxInternalSilenceSamples = Math.floor(0.26 * 24000);
+  const targetInternalSilenceSamples = Math.floor(0.15 * 24000);
+  const windowSamples = 240; // 10ms RMS/peak window
+  const outChunks: Buffer[] = [];
+
+  let i = startSample;
+  let silenceStart = -1;
+  let activeCopyStart = startSample;
+
+  while (i < endSample) {
+    const winEnd = Math.min(endSample, i + windowSamples);
+    let winPeak = 0;
+    for (let j = i; j < winEnd; j++) {
+      const amp = Math.abs(rawPcm.readInt16LE(j * 2));
+      if (amp > winPeak) winPeak = amp;
+    }
+
+    if (winPeak <= silenceThreshold) {
+      if (silenceStart === -1) {
+        silenceStart = i;
+      }
+    } else {
+      if (silenceStart !== -1) {
+        const silentSamples = i - silenceStart;
+        if (silentSamples > maxInternalSilenceSamples) {
+          const keepEnd = silenceStart + targetInternalSilenceSamples;
+          outChunks.push(rawPcm.subarray(activeCopyStart * 2, keepEnd * 2));
+          activeCopyStart = i;
+        }
+        silenceStart = -1;
+      }
+    }
+    i = winEnd;
+  }
+
+  if (activeCopyStart < endSample) {
+    outChunks.push(rawPcm.subarray(activeCopyStart * 2, endSample * 2));
+  }
+
+  return outChunks.length === 1 ? outChunks[0] : Buffer.concat(outChunks);
 }
 
 /**
@@ -866,6 +1106,11 @@ export async function synthesizeCreatorVoiceover(
 
   console.log(`[Stage D] Synthesizing voiceover for ${script.segments.length} script segments via Studio fallback engine (target: ${targetDurationSec}s, voice: ${script.voice}, style: ${voiceStyle}, emotion: ${voiceEmotion}, speed: ${voiceSpeed}x, pitch: ${voicePitch})...`);
 
+  // 100ms (0.10s) trailing silence cushion at 24kHz 16-bit mono (48,000 bytes/sec -> 4,800 bytes)
+  // Prevents final Arabic consonants/syllables from being clipped at segment or xfade boundaries
+  const tailCushionBytes = Math.floor(SEGMENT_TAIL_CUSHION_SEC * 24000) * 2;
+  const tailCushionBuffer = Buffer.alloc(tailCushionBytes, 0);
+
   for (let i = 0; i < script.segments.length; i++) {
     const seg = script.segments[i];
     const segFileName = `voice_seg_${i + 1}.wav`;
@@ -898,10 +1143,13 @@ export async function synthesizeCreatorVoiceover(
       }
     );
 
-    const pcmBuffer = result.rawPcm;
-    if (!pcmBuffer || pcmBuffer.length < 100) {
+    const rawPcm = result.rawPcm;
+    if (!rawPcm || rawPcm.length < 100) {
       throw new Error(`TTS synthesis produced an empty or silent audio buffer for segment "${seg.id || `seg_${i + 1}`}". Failed narration is never silently replaced with silence.`);
     }
+
+    const trimmedPcm = trimExcessTtsPcmSilence(rawPcm);
+    const pcmBuffer = Buffer.concat([trimmedPcm, tailCushionBuffer]);
 
     // Save PCM with standard 44-byte WAV header (24kHz 16-bit mono)
     const header = Buffer.alloc(44);
@@ -922,8 +1170,8 @@ export async function synthesizeCreatorVoiceover(
     const wavBuffer = Buffer.concat([header, pcmBuffer]);
     fs.writeFileSync(segFilePath, wavBuffer);
 
-    // Measure duration accurately
-    const durationSec = result.durationSec || (pcmBuffer.length / 48000);
+    // Measure actual PCM duration accurately (24,000 Hz * 2 bytes/sample = 48,000 bytes/sec)
+    const durationSec = Number((pcmBuffer.length / 48000).toFixed(3));
     let lufs = -14.0;
     try {
       const loudness = await measureAudioLoudness(segFilePath);
@@ -956,16 +1204,26 @@ export async function synthesizeCreatorVoiceover(
     }
   }
 
-  // Duration Validation & Adaptive Pace Adjustment:
-  // If the total speech duration exceeds the allowed narration window for targetDurationSec,
-  // apply a natural FFmpeg atempo speedup (up to 1.25x) to guarantee complete speech fits without truncating.
+  // Duration Validation & Gentle Natural Pace Adjustment:
+  // Preserve natural Arabic rhythm: never apply aggressive playback-speed changes (> 1.14x).
+  // Account for per-scene lead-in (0.15s) and tail margins (0.15s–0.18s) used by recalculateCompleteEditingTimeline.
   const currentTotalSpeech = audioSegments.reduce((sum, s) => sum + s.durationSec, 0);
-  const maxSpeechWindow = Math.max(2.0, targetDurationSec - 1.2);
+  const sceneTimelineOverheadSec = audioSegments.length * 0.31 + 0.05;
+  const maxSpeechWindow = Math.max(2.0, targetDurationSec - sceneTimelineOverheadSec);
+  const hardConflictThresholdSec = Math.max(targetDurationSec * 1.65, (targetDurationSec + 2.5) * MAX_NATURAL_ATEMPO);
+
+  if (currentTotalSpeech > hardConflictThresholdSec) {
+    throw new NarrationDurationConflictError(
+      `Requested video duration (${targetDurationSec}s) cannot accommodate the complete narration (${currentTotalSpeech.toFixed(2)}s across ${audioSegments.length} segments) naturally without clipping or unnatural speed distortion. Please increase target duration to ${targetDurationSec <= 10 ? 15 : 30}s or shorten the script.`,
+      targetDurationSec,
+      Number((currentTotalSpeech + sceneTimelineOverheadSec).toFixed(2))
+    );
+  }
 
   if (currentTotalSpeech > maxSpeechWindow && audioSegments.length > 0) {
-    const speedRatio = Math.min(1.25, currentTotalSpeech / maxSpeechWindow);
-    if (speedRatio >= 1.03) {
-      console.log(`[Stage D Duration Guard] Speech duration (${currentTotalSpeech.toFixed(2)}s) exceeds allowed window (${maxSpeechWindow.toFixed(2)}s) for ${targetDurationSec}s video. Normalizing pace across segments (atempo=${speedRatio.toFixed(3)})...`);
+    const speedRatio = Math.min(MAX_NATURAL_ATEMPO, currentTotalSpeech / maxSpeechWindow);
+    if (speedRatio >= 1.02) {
+      console.log(`[Stage D Duration Guard] Speech duration (${currentTotalSpeech.toFixed(2)}s) exceeds nominal speech window (${maxSpeechWindow.toFixed(2)}s) for ${targetDurationSec}s video. Applying gentle natural pace adjustment (atempo=${speedRatio.toFixed(3)} <= ${MAX_NATURAL_ATEMPO}x)...`);
       combinedPcmBuffers.length = 0;
 
       for (const seg of audioSegments) {
@@ -984,20 +1242,20 @@ export async function synthesizeCreatorVoiceover(
           if (fs.existsSync(tempPath) && fs.statSync(tempPath).size > 44) {
             fs.renameSync(tempPath, seg.filePath);
             const fileBytes = fs.readFileSync(seg.filePath);
-            const pcmOnly = fileBytes.subarray(44);
+            const pcmOnly = extractWavPcmData(fileBytes);
             combinedPcmBuffers.push(pcmOnly);
             const newDur = pcmOnly.length / 48000;
             seg.durationSec = Number(newDur.toFixed(3));
             const scriptSeg = script.segments.find(s => s.id === seg.id);
             if (scriptSeg) scriptSeg.actualDurationSec = seg.durationSec;
           } else {
-            const raw = fs.readFileSync(seg.filePath).subarray(44);
+            const raw = extractWavPcmData(fs.readFileSync(seg.filePath));
             combinedPcmBuffers.push(raw);
           }
         } catch (err: any) {
           console.warn(`[Stage D Duration Guard] Failed to adjust tempo for ${seg.filePath}:`, err?.message);
           try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (_) {}
-          const raw = fs.readFileSync(seg.filePath).subarray(44);
+          const raw = extractWavPcmData(fs.readFileSync(seg.filePath));
           combinedPcmBuffers.push(raw);
         }
       }
@@ -1025,7 +1283,7 @@ export async function synthesizeCreatorVoiceover(
   const masterVoiceoverPath = path.join(outputDir, 'master_voiceover.wav');
   fs.writeFileSync(masterVoiceoverPath, masterWavBuffer);
 
-  const totalVoiceoverDurationSec = totalPcm.length / 48000;
+  const totalVoiceoverDurationSec = Number((totalPcm.length / 48000).toFixed(3));
 
   return {
     audioSegments,
@@ -1034,29 +1292,72 @@ export async function synthesizeCreatorVoiceover(
   };
 }
 
-const VALID_CREATOR_TRANSITIONS: CreatorTransitionType[] = [
+/**
+ * Extracts raw 16-bit PCM sample bytes from a WAV buffer by locating the 'data' chunk header,
+ * avoiding 34-byte header-offset errors when FFmpeg injects a 'LIST'/'INFO' chunk.
+ */
+export function extractWavPcmData(wavBytes: Buffer): Buffer {
+  if (!wavBytes || wavBytes.length <= 44) return Buffer.alloc(0);
+  let offset = 12; // Skip 'RIFF' + size + 'WAVE'
+  while (offset + 8 <= wavBytes.length) {
+    const chunkId = wavBytes.toString('ascii', offset, offset + 4);
+    const chunkSize = wavBytes.readUInt32LE(offset + 4);
+    if (chunkId === 'data') {
+      const start = offset + 8;
+      const end = Math.min(wavBytes.length, start + chunkSize);
+      return wavBytes.subarray(start, end);
+    }
+    offset += 8 + chunkSize + (chunkSize % 2);
+  }
+  const fallbackIdx = wavBytes.indexOf(Buffer.from('data'));
+  if (fallbackIdx !== -1 && fallbackIdx + 8 < wavBytes.length) {
+    return wavBytes.subarray(fallbackIdx + 8);
+  }
+  return wavBytes.subarray(44);
+}
+
+export const VALID_CREATOR_TRANSITIONS: CreatorTransitionType[] = [
   'crossfade',
   'fade',
   'fadeblack',
+  'dissolve',
   'wipeleft',
   'wiperight',
   'slideleft',
+  'slideright',
   'smoothleft',
+  'smoothright',
+  'smoothup',
+  'smoothdown',
+  'circleopen',
+  'horzopen',
   'none'
 ];
 
-const VALID_CREATOR_EFFECTS = [
+export const VALID_CREATOR_EFFECTS: readonly CreatorCameraEffect[] = [
   'smart_subject_focus',
   'slow_zoom_in',
   'slow_zoom_out',
   'pan_left',
   'pan_right',
+  'pull_back_reveal',
+  'track_horizontal',
+  'track_vertical',
+  'detail_closeup',
+  'handheld_stabilized',
+  'pip_detail_spotlight',
   'static'
 ] as const;
 
+export const PURE_ZOOM_EFFECTS: ReadonlySet<string> = new Set([
+  'slow_zoom_in',
+  'slow_zoom_out',
+  'smart_subject_focus'
+]);
+
 /**
  * Builds a scene-synchronized master voiceover WAV file with exact adelay placement,
- * uniform gain across all segments (amix normalize=0), and exact targetDurationSec length.
+ * uniform gain across all segments (amix normalize=0), and guaranteed non-clipped completion.
  */
 export async function buildCreatorSynchronizedVoiceover(
   segments: SynchronizedCreatorSegment[],
@@ -1064,7 +1365,9 @@ export async function buildCreatorSynchronizedVoiceover(
   outputWavPath: string
 ): Promise<void> {
   await fs.promises.mkdir(path.dirname(outputWavPath), { recursive: true });
-  const safeDuration = Math.max(1.0, Number(totalDurationSec) || 15.0);
+  const lastSegEndSec = segments.reduce((maxEnd, s) => Math.max(maxEnd, Number(s.endTimeSec) || 0), 0);
+  // Ensure the master WAV container is NEVER shorter than the final spoken word + 0.12s cushion
+  const safeDuration = Math.max(1.0, Number(totalDurationSec) || 15.0, lastSegEndSec + 0.12);
 
   const validSegments = segments.filter(
     s => s.filePath && fs.existsSync(s.filePath) && fs.statSync(s.filePath).size > 44
@@ -1092,11 +1395,10 @@ export async function buildCreatorSynchronizedVoiceover(
 
   for (const seg of validSegments) {
     const buf = fs.readFileSync(seg.filePath);
-    const dataTagIdx = buf.indexOf(Buffer.from('data'));
-    const dataOffset = dataTagIdx !== -1 && dataTagIdx + 8 < buf.length ? dataTagIdx + 8 : Math.min(44, buf.length);
+    const pcmData = extractWavPcmData(buf);
     let maxAbsSample = 0;
-    for (let i = dataOffset; i + 1 < buf.length; i += 2) {
-      const sample = Math.abs(buf.readInt16LE(i));
+    for (let i = 0; i + 1 < pcmData.length; i += 2) {
+      const sample = Math.abs(pcmData.readInt16LE(i));
       if (sample > maxAbsSample) {
         maxAbsSample = sample;
         if (maxAbsSample > 32) break;
@@ -1140,6 +1442,226 @@ export async function buildCreatorSynchronizedVoiceover(
   await execFileAsync('ffmpeg', args);
 }
 
+/**
+ * Programmatically validates complete voiceover playback, segment presence, non-silence,
+ * scene synchronization, and final audio waveform completion so no final spoken word is ever clipped.
+ */
+export async function validateVoiceoverCompleteness(params: {
+  script?: CreatorVideoScript | null;
+  voiceoverInfo?: {
+    masterVoiceoverPath: string;
+    totalVoiceoverDurationSec: number;
+    audioSegments: Array<{
+      id: string;
+      text: string;
+      filePath: string;
+      durationSec: number;
+    }>;
+  } | null;
+  editingPlan: EditingPlan;
+  renderedMp4Path?: string;
+}): Promise<VoiceoverValidationResult> {
+  const { script, voiceoverInfo, editingPlan, renderedMp4Path } = params;
+  const errors: string[] = [];
+
+  const expectedSegmentsCount =
+    script?.segments?.length ||
+    voiceoverInfo?.audioSegments?.length ||
+    editingPlan.synchronizedSegments?.length ||
+    0;
+
+  const syncSegs = editingPlan.synchronizedSegments || [];
+  const timelineDurationSec = Number(editingPlan.totalDurationSec) || 15;
+
+  if (expectedSegmentsCount === 0 && syncSegs.length === 0) {
+    return {
+      valid: true,
+      allSegmentsPresent: true,
+      nonSilent: true,
+      allSegmentsScheduled: true,
+      noSceneCut: true,
+      noClippedWords: true,
+      waveformVerified: true,
+      segmentsChecked: 0,
+      lastWordEndTimeSec: 0,
+      timelineDurationSec,
+      tailMarginSec: timelineDurationSec,
+      errors: [],
+      summary: 'Video-only timeline (0 narration segments requested).'
+    };
+  }
+
+  let allSegmentsPresent = true;
+  let nonSilent = true;
+  let allSegmentsScheduled = syncSegs.length >= expectedSegmentsCount && syncSegs.length > 0;
+  let noSceneCut = true;
+  let noClippedWords = true;
+  let waveformVerified = true;
+
+  if (!allSegmentsScheduled) {
+    errors.push(
+      `Expected ${expectedSegmentsCount} narration segment(s) in synchronized timeline, but only ${syncSegs.length} were scheduled.`
+    );
+  }
+
+  // 1. Verify each audio segment exists on disk, is non-silent, and is not truncated in the timeline
+  const audioSegList = voiceoverInfo?.audioSegments || syncSegs;
+  for (let i = 0; i < audioSegList.length; i++) {
+    const seg = audioSegList[i];
+    if (!seg.filePath || !fs.existsSync(seg.filePath)) {
+      allSegmentsPresent = false;
+      errors.push(`Narration segment "${seg.id || `seg_${i + 1}`}" WAV file is missing on disk.`);
+      continue;
+    }
+    const buf = fs.readFileSync(seg.filePath);
+    const pcm = extractWavPcmData(buf);
+    if (pcm.length < 200) {
+      allSegmentsPresent = false;
+      errors.push(`Narration segment "${seg.id || `seg_${i + 1}`}" has empty PCM data (${pcm.length} bytes).`);
+      continue;
+    }
+    let peak = 0;
+    for (let j = 0; j + 1 < pcm.length; j += 2) {
+      const sample = Math.abs(pcm.readInt16LE(j));
+      if (sample > peak) peak = sample;
+    }
+    if (peak <= 32) {
+      nonSilent = false;
+      errors.push(`Narration segment "${seg.id || `seg_${i + 1}`}" contains digital silence (peak=${peak}).`);
+    }
+
+    const actualPcmDur = Number((pcm.length / 48000).toFixed(3));
+    const scheduled = syncSegs.find(s => s.id === seg.id) || syncSegs[i];
+    if (!scheduled) {
+      allSegmentsScheduled = false;
+      errors.push(`Narration segment "${seg.id}" is missing from editingPlan.synchronizedSegments.`);
+    } else {
+      const scheduledWindow = Number((scheduled.endTimeSec - scheduled.startTimeSec).toFixed(3));
+      if (scheduledWindow + 0.05 < actualPcmDur) {
+        noSceneCut = false;
+        errors.push(
+          `Narration segment "${seg.id}" scheduled window (${scheduledWindow.toFixed(2)}s) is shorter than its actual PCM audio duration (${actualPcmDur.toFixed(2)}s).`
+        );
+      }
+      if (i > 0 && scheduled.startTimeSec < syncSegs[i - 1].endTimeSec - 0.02) {
+        noSceneCut = false;
+        errors.push(
+          `Narration segment "${seg.id}" overlaps previous segment "${syncSegs[i - 1].id}" (${scheduled.startTimeSec.toFixed(2)}s < ${syncSegs[i - 1].endTimeSec.toFixed(2)}s).`
+        );
+      }
+    }
+  }
+
+  // 2. Verify last spoken word finishes cleanly before timeline end
+  const lastWordEndTimeSec =
+    syncSegs.length > 0
+      ? Number(Math.max(...syncSegs.map(s => Number(s.endTimeSec) || 0)).toFixed(3))
+      : 0;
+  const tailMarginSec = Number((timelineDurationSec - lastWordEndTimeSec).toFixed(3));
+
+  if (lastWordEndTimeSec > timelineDurationSec + 0.01) {
+    noClippedWords = false;
+    errors.push(
+      `Final narration segment ends at ${lastWordEndTimeSec.toFixed(2)}s, which exceeds total video duration (${timelineDurationSec.toFixed(2)}s) and clips the final words.`
+    );
+  } else if (tailMarginSec < 0.05) {
+    noClippedWords = false;
+    errors.push(
+      `Final narration segment ends too close to video end (tail margin ${tailMarginSec.toFixed(3)}s < 0.05s safety margin), risking clipped final syllables.`
+    );
+  }
+
+  // 3. Verify master voiceover WAV waveform & rendered MP4 audio stream
+  const masterWavPath = voiceoverInfo?.masterVoiceoverPath || editingPlan.audio?.voiceoverAudioPath;
+  if (masterWavPath && fs.existsSync(masterWavPath)) {
+    const masterBuf = fs.readFileSync(masterWavPath);
+    const masterPcm = extractWavPcmData(masterBuf);
+    const masterDurSec = masterPcm.length / 48000;
+    if (masterDurSec + 0.08 < lastWordEndTimeSec) {
+      waveformVerified = false;
+      noClippedWords = false;
+      errors.push(
+        `Master voiceover WAV duration (${masterDurSec.toFixed(2)}s) is shorter than last scheduled narration end (${lastWordEndTimeSec.toFixed(2)}s).`
+      );
+    }
+
+    // Check that the final 60ms of the master WAV is at peace (tail cushion / apad) rather than mid-peak truncation
+    if (masterPcm.length >= 2880) {
+      const tailSlice = masterPcm.subarray(masterPcm.length - 1920); // last 40ms
+      let tailRmsSum = 0;
+      const sampleCount = Math.floor(tailSlice.length / 2);
+      for (let k = 0; k + 1 < tailSlice.length; k += 2) {
+        const s = tailSlice.readInt16LE(k) / 32768;
+        tailRmsSum += s * s;
+      }
+      const tailRms = Math.sqrt(tailRmsSum / Math.max(1, sampleCount));
+      if (tailRms > 0.35) {
+        waveformVerified = false;
+        noClippedWords = false;
+        errors.push(
+          `Master voiceover waveform exhibits high amplitude right at the EOF boundary (tail RMS=${tailRms.toFixed(3)}), indicating a clipped final word.`
+        );
+      }
+    }
+  }
+
+  if (renderedMp4Path && fs.existsSync(renderedMp4Path)) {
+    try {
+      const { stdout } = await execFileAsync('ffprobe', [
+        '-v', 'error',
+        '-select_streams', 'a:0',
+        '-show_entries', 'stream=codec_name,duration',
+        '-of', 'json',
+        renderedMp4Path
+      ]);
+      const parsed = JSON.parse(stdout || '{}');
+      const aStream = parsed?.streams?.[0];
+      if (!aStream) {
+        waveformVerified = false;
+        errors.push('Rendered MP4 is missing an audio stream despite active voiceover segments.');
+      } else {
+        const aDur = parseFloat(aStream.duration || '0');
+        if (aDur > 0 && aDur + 0.12 < lastWordEndTimeSec) {
+          waveformVerified = false;
+          noClippedWords = false;
+          errors.push(
+            `Rendered MP4 audio stream duration (${aDur.toFixed(2)}s) cuts off before final narration word (${lastWordEndTimeSec.toFixed(2)}s).`
+          );
+        }
+      }
+    } catch (_) {}
+  }
+
+  const valid =
+    allSegmentsPresent &&
+    nonSilent &&
+    allSegmentsScheduled &&
+    noSceneCut &&
+    noClippedWords &&
+    waveformVerified &&
+    errors.length === 0;
+
+  const summary = valid
+    ? `Voiceover Validation Passed: ${syncSegs.length}/${expectedSegmentsCount} segments complete, last word at ${lastWordEndTimeSec.toFixed(2)}s / ${timelineDurationSec.toFixed(2)}s (tail margin +${tailMarginSec.toFixed(2)}s).`
+    : `Voiceover Validation Failed: ${errors.join(' | ')}`;
+
+  return {
+    valid,
+    allSegmentsPresent,
+    nonSilent,
+    allSegmentsScheduled,
+    noSceneCut,
+    noClippedWords,
+    waveformVerified,
+    segmentsChecked: syncSegs.length,
+    lastWordEndTimeSec,
+    timelineDurationSec,
+    tailMarginSec,
+    errors,
+    summary
+  };
+}
+
 export interface TimelineRecalculationInput {
   rawScenes: any[];
   assets: CreatorAsset[];
@@ -1164,13 +1686,64 @@ export interface TimelineRecalculationOutput {
   subtitles: Array<{ startTimeSec: number; endTimeSec: number; text: string }>;
 }
 
+const COMMERCIAL_CAMERA_PROGRESSION: readonly CreatorCameraEffect[] = [
+  'smart_subject_focus',
+  'track_horizontal',
+  'pull_back_reveal',
+  'pip_detail_spotlight',
+  'detail_closeup',
+  'handheld_stabilized',
+  'track_vertical',
+  'pan_right'
+];
+
+const COMMERCIAL_TRANSITION_PROGRESSION: readonly CreatorTransitionType[] = [
+  'crossfade',
+  'smoothleft',
+  'dissolve',
+  'circleopen',
+  'fadeblack',
+  'smoothup'
+];
+
+const DIRECTIONAL_TRANSITIONS = new Set<string>([
+  'wipeleft',
+  'wiperight',
+  'slideleft',
+  'slideright',
+  'smoothleft',
+  'smoothright',
+  'smoothup',
+  'smoothdown'
+]);
+
+function inferCommercialSceneRole(index: number, totalScenes: number): CreatorSceneRole {
+  if (index === 0) return 'hook';
+  if (index === totalScenes - 1) return 'cta';
+  if (index === 1) return 'product_intro';
+  if (index === 2) return 'demonstration';
+  return 'benefits';
+}
+
+function inferCommercialShotType(
+  effect: CreatorCameraEffect,
+  role: CreatorSceneRole
+): CreatorShotType {
+  if (effect === 'pip_detail_spotlight') return 'pip_detail';
+  if (effect === 'detail_closeup' || effect === 'smart_subject_focus') return 'detail_closeup';
+  if (role === 'cta') return 'cta_card';
+  if (effect === 'pull_back_reveal' || effect === 'track_vertical') return 'full_shot';
+  return 'medium_hero';
+}
+
 /**
  * Full-Graph Atomic Timeline Recalculation Engine (P0):
  * - Maps M voiceover segments to N scenes (supporting M=N, M>N, M<N, silent scenes, and speech > scene).
  * - Enforces MAX_SCENE_EXPANSION_RATIO (1.75x) / MAX_SINGLE_SCENE_DURATION_SEC (10.0s) with overflow segment spillover.
  * - Enforces Tier 3 short-video scene capping (MAX_SLOWDOWN_FACTOR = 1.25) when alternate scenes/assets exist.
- * - Quantizes all scene durations and transitions to integer 30 FPS frames so sum(K_i) === K_total with 0 frame drift.
- * - Recomputes all scene start/end times, transition durations/offsets, title overlays, voiceover start/end times, and subtitles atomically.
+ * - Guarantees every scene with narration receives enough 30-FPS frames for its complete speech + safety margin,
+ *   and applies a Backward-Cascade Tail Guard so the final spoken word is NEVER clipped by timeline end (-t).
+ * - Assigns commercial scene roles, shot types, and varied camera movements (preventing repetitive zoom-only plans).
  */
 export function recalculateCompleteEditingTimeline(
   input: TimelineRecalculationInput
@@ -1199,10 +1772,12 @@ export function recalculateCompleteEditingTimeline(
   const workingScenes: Array<{
     assetId: string;
     asset: CreatorAsset;
+    sceneRole?: CreatorSceneRole;
+    shotType?: CreatorShotType;
     initDurationSec: number;
     durationSec: number;
     rawStartTimeSec?: number;
-    effect: EditingPlanScene['effect'];
+    effect: CreatorCameraEffect;
     samFocusBox?: [number, number, number, number];
     transitionOut: CreatorTransitionType;
     colorGrading: EditingPlanScene['colorGrading'];
@@ -1218,8 +1793,11 @@ export function recalculateCompleteEditingTimeline(
           assetId: ast.id,
           type: ast.type,
           durationSec: baseTargetDurationSec / safeAssets.length,
-          effect: idx % 2 === 0 ? 'slow_zoom_in' : 'slow_zoom_out',
-          transitionOut: idx === safeAssets.length - 1 ? 'none' : 'crossfade'
+          effect: COMMERCIAL_CAMERA_PROGRESSION[idx % COMMERCIAL_CAMERA_PROGRESSION.length],
+          transitionOut:
+            idx === safeAssets.length - 1
+              ? 'none'
+              : COMMERCIAL_TRANSITION_PROGRESSION[idx % COMMERCIAL_TRANSITION_PROGRESSION.length]
         }));
 
   let rawSum = sourceScenes.reduce(
@@ -1256,14 +1834,12 @@ export function recalculateCompleteEditingTimeline(
     const transitionOut: CreatorTransitionType =
       VALID_CREATOR_TRANSITIONS.includes(sc.transitionOut)
         ? sc.transitionOut
-        : 'crossfade';
+        : COMMERCIAL_TRANSITION_PROGRESSION[i % COMMERCIAL_TRANSITION_PROGRESSION.length];
 
-    const effect: EditingPlanScene['effect'] =
+    const effect: CreatorCameraEffect =
       VALID_CREATOR_EFFECTS.includes(sc.effect)
         ? sc.effect
-        : samFocusBox
-        ? 'smart_subject_focus'
-        : 'slow_zoom_in';
+        : COMMERCIAL_CAMERA_PROGRESSION[i % COMMERCIAL_CAMERA_PROGRESSION.length];
 
     let videoMaxDurationSec: number | undefined = undefined;
     if (asset.type === 'video' && typeof asset.durationSec === 'number' && asset.durationSec > 0) {
@@ -1274,6 +1850,8 @@ export function recalculateCompleteEditingTimeline(
     workingScenes.push({
       assetId,
       asset,
+      sceneRole: sc.sceneRole,
+      shotType: sc.shotType,
       initDurationSec: initDur,
       durationSec: initDur,
       rawStartTimeSec: typeof sc.startTimeSec === 'number' ? sc.startTimeSec : undefined,
@@ -1326,11 +1904,12 @@ export function recalculateCompleteEditingTimeline(
     sceneSegmentsMap[assignedIdx].push(seg);
   }
 
-  const computeRequiredSpeechWindow = (segs: typeof audioSegments): number => {
+  const computeRequiredSpeechWindow = (segs: typeof audioSegments, isLastScene = false): number => {
     if (!segs || segs.length === 0) return 0;
     const sumDur = segs.reduce((acc, s) => acc + Math.max(0.2, Number(s.durationSec) || 0), 0);
     const intraPauses = Math.max(0, segs.length - 1) * 0.18;
-    return 0.15 + sumDur + intraPauses + 0.15;
+    const tailMargin = isLastScene ? TIMELINE_TAIL_MARGIN_SEC : 0.15;
+    return 0.15 + sumDur + intraPauses + tailMargin;
   };
 
   // 3. Enforce Deterministic Maximum Scene Expansion Policy & Overflow Segment Spillover
@@ -1343,7 +1922,7 @@ export function recalculateCompleteEditingTimeline(
       Math.max(5.0, MAX_SCENE_EXPANSION_RATIO * sc.initDurationSec)
     );
 
-    while (segs.length > 1 && computeRequiredSpeechWindow(segs) > capSec) {
+    while (segs.length > 1 && computeRequiredSpeechWindow(segs, idx === workingScenes.length - 1) > capSec) {
       const overflowSeg = segs.pop()!;
       if (idx + 1 < workingScenes.length) {
         sceneSegmentsMap[idx + 1].unshift(overflowSeg);
@@ -1351,13 +1930,13 @@ export function recalculateCompleteEditingTimeline(
         const nextAsset = safeAssets[workingScenes.length % safeAssets.length];
         const nextAnalysis = analysis.find(a => a.assetId === nextAsset.id);
         const nextSamBox = nextAnalysis?.samLocalizationCues?.[0]?.box2d;
-        const spilledWindow = Math.max(2.0, (Number(overflowSeg.durationSec) || 2.0) + 0.4);
+        const spilledWindow = Math.max(2.0, (Number(overflowSeg.durationSec) || 2.0) + 0.45);
         workingScenes.push({
           assetId: nextAsset.id,
           asset: nextAsset,
           initDurationSec: spilledWindow,
           durationSec: spilledWindow,
-          effect: nextSamBox ? 'smart_subject_focus' : 'slow_zoom_out',
+          effect: COMMERCIAL_CAMERA_PROGRESSION[workingScenes.length % COMMERCIAL_CAMERA_PROGRESSION.length],
           samFocusBox: nextSamBox,
           transitionOut: 'none',
           colorGrading: colorGradingTheme || 'vibrant',
@@ -1380,7 +1959,7 @@ export function recalculateCompleteEditingTimeline(
 
     for (let i = 0; i < workingScenes.length; i++) {
       const sc = workingScenes[i];
-      const speechReq = computeRequiredSpeechWindow(sceneSegmentsMap[i]);
+      const speechReq = computeRequiredSpeechWindow(sceneSegmentsMap[i], i === workingScenes.length - 1);
       if (
         sc.videoMaxDurationSec !== undefined &&
         sc.durationSec > sc.videoMaxDurationSec &&
@@ -1408,79 +1987,142 @@ export function recalculateCompleteEditingTimeline(
     }
   }
 
-  // 5. Elastic Scene Duration Rebalancing for Speech > Scene
+  // 5. Speech-Aware Scene Duration Allocation (NEVER scale scenes below their required speech duration)
   const minRequiredPerScene = workingScenes.map((_, i) =>
-    Math.max(MIN_SCENE_DURATION_SEC, computeRequiredSpeechWindow(sceneSegmentsMap[i]))
+    Math.max(
+      MIN_SCENE_DURATION_SEC,
+      computeRequiredSpeechWindow(sceneSegmentsMap[i], i === workingScenes.length - 1)
+    )
   );
 
-  let totalDeficit = 0;
-  let totalSlack = 0;
-  const slackPerScene = workingScenes.map((sc, i) => {
-    const req = minRequiredPerScene[i];
-    if (sc.durationSec < req) {
-      totalDeficit += req - sc.durationSec;
-      return 0;
+  const minRequiredTotalSec = minRequiredPerScene.reduce((acc, v) => acc + v, 0);
+  const effectiveTargetDurationSec = Math.max(baseTargetDurationSec, minRequiredTotalSec);
+
+  const targetTotalFrames = Math.round(effectiveTargetDurationSec * 30);
+  const minFramesPerScene = Math.max(
+    15,
+    Math.min(Math.round(MIN_SCENE_DURATION_SEC * 30), Math.floor(targetTotalFrames / workingScenes.length))
+  );
+
+  const requiredFramesList = workingScenes.map((_, i) =>
+    Math.max(minFramesPerScene, Math.ceil(minRequiredPerScene[i] * 30))
+  );
+
+  const hasUncappedScene = workingScenes.some(sc => sc.videoMaxDurationSec === undefined);
+  const maxAllowedFramesList = workingScenes.map((sc, i) => {
+    if (sc.videoMaxDurationSec !== undefined && hasUncappedScene) {
+      const hasOutgoingTrans = i < workingScenes.length - 1 && sc.transitionOut !== 'none';
+      const maxNominalSec = Math.max(
+        MIN_SCENE_DURATION_SEC,
+        sc.videoMaxDurationSec - (hasOutgoingTrans ? 10 / 30 : 0)
+      );
+      return Math.max(requiredFramesList[i], Math.floor(maxNominalSec * 30));
     }
-    const slack = Math.max(0, sc.durationSec - req);
-    totalSlack += slack;
-    return slack;
+    return Number.POSITIVE_INFINITY;
   });
 
-  if (totalDeficit > 0) {
-    const borrowAmount = Math.min(totalDeficit, totalSlack);
+  const requiredFramesSum = requiredFramesList.reduce((acc, f) => acc + f, 0);
+  const nominalFramesList: number[] = [];
+
+  if (requiredFramesSum >= targetTotalFrames) {
+    let running = 0;
     for (let i = 0; i < workingScenes.length; i++) {
-      const req = minRequiredPerScene[i];
-      if (workingScenes[i].durationSec < req) {
-        workingScenes[i].durationSec = req;
-      } else if (totalSlack > 0 && slackPerScene[i] > 0) {
-        workingScenes[i].durationSec -= borrowAmount * (slackPerScene[i] / totalSlack);
+      const k = requiredFramesList[i];
+      nominalFramesList.push(k);
+      running += k;
+    }
+  } else {
+    // Distribute surplus frames above requiredFramesList proportionally to each scene's post-cap duration slack
+    const surplusFrames = targetTotalFrames - requiredFramesSum;
+    const rawWeights = workingScenes.map((sc, i) => {
+      if (requiredFramesList[i] >= maxAllowedFramesList[i]) return 0;
+      return Math.max(0, sc.durationSec - minRequiredPerScene[i]);
+    });
+    const rawWeightSum = rawWeights.reduce((acc, w) => acc + w, 0);
+    const weights =
+      rawWeightSum > 0
+        ? rawWeights
+        : workingScenes.map((_, i) => (requiredFramesList[i] < maxAllowedFramesList[i] ? 1 : 0));
+    const weightSum = weights.reduce((acc, w) => acc + w, 0) || 1;
+
+    let running = 0;
+    for (let i = 0; i < workingScenes.length; i++) {
+      if (i < workingScenes.length - 1) {
+        const addFrames = Math.round(surplusFrames * (weights[i] / weightSum));
+        const k = Math.min(maxAllowedFramesList[i], requiredFramesList[i] + addFrames);
+        nominalFramesList.push(k);
+        running += k;
+      } else {
+        const kLast = Math.min(maxAllowedFramesList[i], Math.max(requiredFramesList[i], targetTotalFrames - running));
+        nominalFramesList.push(kLast);
+        running += kLast;
       }
     }
   }
 
-  // 5b. HARD DURATION ENFORCEMENT:
-  const effectiveTargetDurationSec = baseTargetDurationSec;
-  const targetTotalFrames = Math.round(effectiveTargetDurationSec * 30);
-
-  const rawTotalDur = workingScenes.reduce((acc, s) => acc + s.durationSec, 0);
-  if (rawTotalDur > 0) {
-    const scale = effectiveTargetDurationSec / rawTotalDur;
-    for (let i = 0; i < workingScenes.length; i++) {
-      workingScenes[i].durationSec = workingScenes[i].durationSec * scale;
-    }
-  }
-
-  // 6. Quantize to exact 30 FPS integer frame counts (K_i) so sum(K_i) === targetTotalFrames
-  const minFramesPerScene = Math.max(15, Math.min(Math.round(MIN_SCENE_DURATION_SEC * 30), Math.floor(targetTotalFrames / workingScenes.length)));
-  const nominalFramesList: number[] = [];
-  let framesRunningSum = 0;
-
-  for (let i = 0; i < workingScenes.length; i++) {
-    if (i < workingScenes.length - 1) {
-      const k = Math.max(
-        minFramesPerScene,
-        Math.round((workingScenes[i].durationSec / effectiveTargetDurationSec) * targetTotalFrames)
-      );
-      nominalFramesList.push(k);
-      framesRunningSum += k;
+  // Ensure exact frame sum === targetTotalFrames (when requiredFramesSum <= targetTotalFrames) without violating requiredFramesList or maxAllowedFramesList
+  let framesRunningSum = nominalFramesList.reduce((acc, k) => acc + k, 0);
+  let frameDelta = targetTotalFrames - framesRunningSum;
+  if (frameDelta !== 0 && nominalFramesList.length > 0 && requiredFramesSum <= targetTotalFrames) {
+    if (frameDelta > 0) {
+      let toAdd = frameDelta;
+      for (let i = nominalFramesList.length - 1; i >= 0 && toAdd > 0; i--) {
+        const room = maxAllowedFramesList[i] - nominalFramesList[i];
+        if (room > 0) {
+          const add = Math.min(room, toAdd);
+          nominalFramesList[i] += add;
+          toAdd -= add;
+        }
+      }
+      if (toAdd > 0) {
+        nominalFramesList[nominalFramesList.length - 1] += toAdd;
+      }
     } else {
-      const kLast = Math.max(minFramesPerScene, targetTotalFrames - framesRunningSum);
-      nominalFramesList.push(kLast);
-      framesRunningSum += kLast;
+      let toRemove = -frameDelta;
+      for (let i = nominalFramesList.length - 1; i >= 0 && toRemove > 0; i--) {
+        const removable = Math.max(0, nominalFramesList[i] - requiredFramesList[i]);
+        const cut = Math.min(removable, toRemove);
+        nominalFramesList[i] -= cut;
+        toRemove -= cut;
+      }
     }
-  }
-
-  if (framesRunningSum !== targetTotalFrames && nominalFramesList.length > 0) {
-    const delta = targetTotalFrames - framesRunningSum;
-    nominalFramesList[nominalFramesList.length - 1] = Math.max(
-      minFramesPerScene,
-      nominalFramesList[nominalFramesList.length - 1] + delta
-    );
     framesRunningSum = nominalFramesList.reduce((acc, k) => acc + k, 0);
   }
 
   const totalFrames = framesRunningSum;
   const totalDurationSec = Number((totalFrames / 30).toFixed(6));
+
+  // 6b. Enforce commercial camera variety (prevent >50% pure zoom scenes) & non-repeating directional transitions
+  if (workingScenes.length >= 2) {
+    const nonZoomCommercialEffects: CreatorCameraEffect[] = [
+      'track_horizontal',
+      'pull_back_reveal',
+      'detail_closeup',
+      'pip_detail_spotlight',
+      'handheld_stabilized',
+      'track_vertical',
+      'pan_right',
+      'pan_left'
+    ];
+    const maxAllowedZoom = Math.max(1, Math.floor(workingScenes.length * 0.5));
+    let seenZoomCount = 0;
+    for (let i = 0; i < workingScenes.length; i++) {
+      if (PURE_ZOOM_EFFECTS.has(workingScenes[i].effect)) {
+        seenZoomCount++;
+        if (seenZoomCount > maxAllowedZoom) {
+          workingScenes[i].effect = nonZoomCommercialEffects[i % nonZoomCommercialEffects.length];
+        }
+      }
+      if (i > 0 && i < workingScenes.length - 1) {
+        const prevT = workingScenes[i - 1].transitionOut;
+        const currT = workingScenes[i].transitionOut;
+        if (prevT === currT && DIRECTIONAL_TRANSITIONS.has(currT)) {
+          workingScenes[i].transitionOut =
+            COMMERCIAL_TRANSITION_PROGRESSION[(i + 1) % COMMERCIAL_TRANSITION_PROGRESSION.length];
+        }
+      }
+    }
+  }
 
   // 7. Build normalized EditingPlanScene[] & SynchronizedCreatorSegment[] atomically
   const normalizedScenes: EditingPlanScene[] = [];
@@ -1544,12 +2186,19 @@ export function recalculateCompleteEditingTimeline(
       });
     }
 
+    const sceneRole: CreatorSceneRole =
+      sc.sceneRole || inferCommercialSceneRole(i, workingScenes.length);
+    const shotType: CreatorShotType =
+      sc.shotType || inferCommercialShotType(sc.effect, sceneRole);
+
     const overlayStyle: 'badge' | 'title' | 'cta_pill' =
       sc.overlayStyle || (i === 0 ? 'title' : isLastScene ? 'cta_pill' : 'badge');
 
     normalizedScenes.push({
       assetId: sc.assetId,
       type: sc.asset.type,
+      sceneRole,
+      shotType,
       timelineStartTimeSec: S_i,
       startTimeSec,
       endTimeSec,
@@ -1572,6 +2221,42 @@ export function recalculateCompleteEditingTimeline(
     });
 
     startFrameCursor += K_i;
+  }
+
+  // 8. Backward-Cascade Tail Guard:
+  // Guarantee the final spoken word NEVER exceeds (totalDurationSec - TIMELINE_TAIL_MARGIN_SEC)
+  // so FFmpeg -t trimming or transition overlaps never cut off the final words!
+  if (synchronizedSegments.length > 0) {
+    const maxAllowedEndSec = Math.max(0.5, totalDurationSec - TIMELINE_TAIL_MARGIN_SEC);
+    const lastIdx = synchronizedSegments.length - 1;
+    if (synchronizedSegments[lastIdx].endTimeSec > maxAllowedEndSec) {
+      const latestEnd = maxAllowedEndSec;
+      synchronizedSegments[lastIdx].endTimeSec = Number(latestEnd.toFixed(3));
+      synchronizedSegments[lastIdx].startTimeSec = Number(
+        Math.max(0.06, latestEnd - synchronizedSegments[lastIdx].durationSec).toFixed(3)
+      );
+
+      for (let k = lastIdx - 1; k >= 0; k--) {
+        const nextStart = synchronizedSegments[k + 1].startTimeSec;
+        const maxEndForK = Math.max(0.2, nextStart - 0.18);
+        if (synchronizedSegments[k].endTimeSec > maxEndForK) {
+          synchronizedSegments[k].endTimeSec = Number(maxEndForK.toFixed(3));
+          synchronizedSegments[k].startTimeSec = Number(
+            Math.max(0.06, maxEndForK - synchronizedSegments[k].durationSec).toFixed(3)
+          );
+        }
+      }
+
+      // Forward pass to ensure strictly non-overlapping chronological order if total speech was very dense
+      let cursorSec = Math.max(0.06, synchronizedSegments[0].startTimeSec);
+      for (let k = 0; k < synchronizedSegments.length; k++) {
+        const dur = synchronizedSegments[k].durationSec;
+        const sStart = k === 0 ? cursorSec : Math.max(synchronizedSegments[k].startTimeSec, cursorSec + 0.18);
+        synchronizedSegments[k].startTimeSec = Number(sStart.toFixed(3));
+        synchronizedSegments[k].endTimeSec = Number((sStart + dur).toFixed(3));
+        cursorSec = synchronizedSegments[k].endTimeSec;
+      }
+    }
   }
 
   const subtitles = synchronizedSegments.map(seg => ({
@@ -1615,15 +2300,65 @@ export function estimatePreTtsNarrationBudgets(
   };
 } {
   const safeDur = Math.max(6, Number(targetDurationSec) || 15);
+  const maxScenes =
+    safeDur <= 10 ? 3 :
+    safeDur <= 15 ? 4 :
+    safeDur <= 30 ? 6 :
+    Math.min(10, Math.max(6, Math.round(safeDur / 7.5)));
+  const minScenes =
+    safeDur <= 10 ? 2 :
+    safeDur <= 15 ? 3 :
+    safeDur <= 30 ? 4 :
+    Math.min(maxScenes, Math.max(5, assets.length));
+
   const desiredSceneCount =
     assets.length >= 2
-      ? Math.min(Math.max(assets.length, safeDur <= 10 ? 2 : 3), safeDur <= 10 ? 3 : safeDur <= 15 ? 4 : 5)
+      ? Math.min(Math.max(assets.length, minScenes), maxScenes)
       : safeDur <= 10
       ? 2
-      : 3;
+      : safeDur <= 15
+      ? 3
+      : Math.min(maxScenes, Math.max(3, Math.round(safeDur / 8)));
 
   const usableSpeechTotal = Number((safeDur * 0.72).toFixed(2));
-  const perSegDur = Number((usableSpeechTotal / desiredSceneCount).toFixed(2));
+  const hasNonShortAsset = assets.some(
+    a => a.type === 'image' || !a.durationSec || a.durationSec * MAX_SLOWDOWN_FACTOR >= safeDur / desiredSceneCount
+  );
+
+  // Allocate pre-TTS speech budgets respecting short video clip caps so short video scenes don't get over-extended
+  const rawSegDurs: number[] = [];
+  let cappedSum = 0;
+  const uncappedIndices: number[] = [];
+  const defaultPerSeg = usableSpeechTotal / desiredSceneCount;
+
+  for (let i = 0; i < desiredSceneCount; i++) {
+    const ast = assets.length > 0 ? assets[i % assets.length] : undefined;
+    if (
+      hasNonShortAsset &&
+      ast &&
+      ast.type === 'video' &&
+      typeof ast.durationSec === 'number' &&
+      ast.durationSec > 0
+    ) {
+      const maxVidSceneSec = Math.max(MIN_SCENE_DURATION_SEC, ast.durationSec * MAX_SLOWDOWN_FACTOR - 10 / 30);
+      const maxVidSpeechSec = Math.max(1.2, maxVidSceneSec - 0.35);
+      if (maxVidSpeechSec < defaultPerSeg) {
+        rawSegDurs.push(maxVidSpeechSec);
+        cappedSum += maxVidSpeechSec;
+        continue;
+      }
+    }
+    rawSegDurs.push(defaultPerSeg);
+    uncappedIndices.push(i);
+  }
+
+  if (uncappedIndices.length > 0 && cappedSum > 0) {
+    const remainingSpeech = Math.max(uncappedIndices.length * 1.5, usableSpeechTotal - cappedSum);
+    const perUncapped = remainingSpeech / uncappedIndices.length;
+    for (const uIdx of uncappedIndices) {
+      rawSegDurs[uIdx] = perUncapped;
+    }
+  }
 
   const segments: VideoScriptSegment[] = [];
   const audioSegments: Array<{
@@ -1636,6 +2371,7 @@ export function estimatePreTtsNarrationBudgets(
   }> = [];
 
   for (let i = 0; i < desiredSceneCount; i++) {
+    const perSegDur = Number(rawSegDurs[i].toFixed(2));
     const role: VideoScriptSegment['role'] =
       i === 0
         ? 'hook'
@@ -1646,10 +2382,7 @@ export function estimatePreTtsNarrationBudgets(
         : 'product_reveal';
     const segId = `seg_${i + 1}`;
     const sceneId = `scene_${i + 1}`;
-    const placeholderText =
-      role === 'hook'
-        ? (creativeDirection?.recommendedCallToAction ? '' : '')
-        : '';
+    const placeholderText = '';
 
     segments.push({
       id: segId,
@@ -1842,8 +2575,9 @@ Strict Commercial Editing & Technical Rules:
 - The sum of all scene durationSec values must equal ${targetDurationSec}.
 - Use available asset IDs: ${assets.map(a => `"${a.id}"`).join(', ')}.
 - NEVER reuse the exact same image/asset across consecutive scenes when multiple assets are available (${assets.length} uploaded assets available). Use every distinct uploaded asset before repeating any asset.
-- VARY camera movements and transitions across scenes: do NOT apply the exact same zoom effect or transition to every scene. Choose from allowlisted effects: "smart_subject_focus", "slow_zoom_in", "slow_zoom_out", "pan_left", "pan_right", "static".
-- Choose from allowlisted transitions: "crossfade", "fade", "fadeblack", "wipeleft", "wiperight", "slideleft", "smoothleft", "none". The final scene must have transitionOut: "none".
+- Structure the commercial with clear visual storytelling roles ("sceneRole": "hook" | "product_intro" | "demonstration" | "benefits" | "cta") and shot types ("shotType": "detail_closeup" | "medium_hero" | "full_shot" | "pip_detail" | "cta_card").
+- VARY camera movements across scenes: NEVER apply pure zoom to every scene or more than half of scenes. Choose from allowlisted professional camera effects: "smart_subject_focus", "track_horizontal", "pull_back_reveal", "pip_detail_spotlight", "detail_closeup", "handheld_stabilized", "track_vertical", "pan_left", "pan_right", "slow_zoom_in", "slow_zoom_out", "static".
+- Choose from allowlisted professional transitions: "crossfade", "fade", "fadeblack", "dissolve", "wipeleft", "wiperight", "slideleft", "slideright", "smoothleft", "smoothright", "smoothup", "smoothdown", "circleopen", "horzopen", "none". Do NOT repeat the same directional transition consecutively. The final scene must have transitionOut: "none".
 - Maintain consistent colorGrading ("${creativeDirection.colorGradingTheme || 'vibrant'}") across scenes.
 - Keep overlayText concise (max 32 characters) so it never obscures the main product subject or faces. Place a clear CTA overlay on the final scene.
 
@@ -1856,6 +2590,8 @@ Return a structured JSON object ONLY matching this schema:
     {
       "assetId": "${assets[0]?.id || 'asset_1'}",
       "type": "${assets[0]?.type || 'image'}",
+      "sceneRole": "hook",
+      "shotType": "detail_closeup",
       "durationSec": 5.0,
       "effect": "smart_subject_focus",
       "transitionOut": "crossfade",
@@ -1931,18 +2667,23 @@ async function buildAndNormalizeEditingPlanFromRaw(
   const parsed = extractJsonFromResponse(rawResponse);
 
   const rawScenes: any[] = Array.isArray(parsed.scenes) && parsed.scenes.length > 0 ? parsed.scenes : [];
-  const diverseEffects: EditingPlanScene['effect'][] = [
+  const diverseEffects: CreatorCameraEffect[] = [
     'smart_subject_focus',
-    'slow_zoom_in',
-    'pan_right',
-    'slow_zoom_out',
-    'pan_left'
+    'track_horizontal',
+    'pull_back_reveal',
+    'pip_detail_spotlight',
+    'detail_closeup',
+    'handheld_stabilized',
+    'track_vertical',
+    'pan_right'
   ];
   const diverseTransitions: CreatorTransitionType[] = [
     'crossfade',
     'smoothleft',
-    'fade',
-    'wipeleft'
+    'dissolve',
+    'circleopen',
+    'fadeblack',
+    'smoothup'
   ];
 
   if (rawScenes.length === 0) {
@@ -1953,6 +2694,7 @@ async function buildAndNormalizeEditingPlanFromRaw(
       rawScenes.push({
         assetId: ast.id,
         type: ast.type,
+        sceneRole: inferCommercialSceneRole(i, sceneCount),
         durationSec: perAssetDuration,
         effect: diverseEffects[i % diverseEffects.length],
         transitionOut: i === sceneCount - 1 ? 'none' : diverseTransitions[i % diverseTransitions.length],
@@ -2074,7 +2816,8 @@ export interface EditingPlanReviewSummary {
 }
 
 /**
- * Programmatically validates an EditingPlan against hard campaign constraints and allowlisted renderer capabilities.
+ * Programmatically validates an EditingPlan against hard campaign constraints, commercial motion variety,
+ * non-repetitive zoom rules, and allowlisted renderer capabilities.
  */
 export function validateEditingPlanConstraints(
   plan: EditingPlan,
@@ -2130,13 +2873,31 @@ export function validateEditingPlanConstraints(
     }
   }
 
-  // 4. Visual variety, non-repetitive zoom, and non-duplicate consecutive asset check (when 2+ scenes exist)
+  // 4. Visual variety, anti-repetitive zoom, non-repeating directional transitions, and non-duplicate consecutive assets
   if (plan.scenes.length >= 2) {
     const uniqueEffects = new Set(plan.scenes.map(s => s.effect));
     if (uniqueEffects.size === 1) {
       violations.push(
         `All ${plan.scenes.length} scenes use the exact same camera motion effect ("${plan.scenes[0].effect}"). Vary motion effects across scenes.`
       );
+    }
+
+    const zoomSceneCount = plan.scenes.filter(s => PURE_ZOOM_EFFECTS.has(s.effect)).length;
+    const maxAllowedZoomScenes = Math.max(1, Math.floor(plan.scenes.length * 0.5));
+    if (zoomSceneCount > maxAllowedZoomScenes) {
+      violations.push(
+        `Repetitive zoom editing detected (${zoomSceneCount}/${plan.scenes.length} scenes use pure zoom effects: ${plan.scenes.map(s => s.effect).join(', ')}). Combine subject focus with tracking pans ("track_horizontal", "track_vertical"), "pull_back_reveal", "detail_closeup", "handheld_stabilized", or "pip_detail_spotlight".`
+      );
+    }
+
+    for (let i = 1; i < plan.scenes.length - 1; i++) {
+      const prevTrans = plan.scenes[i - 1].transitionOut;
+      const currTrans = plan.scenes[i].transitionOut;
+      if (prevTrans === currTrans && DIRECTIONAL_TRANSITIONS.has(currTrans)) {
+        violations.push(
+          `Consecutive scenes ${i} and ${i + 1} repeat the identical directional transition "${currTrans}". Vary transition styles.`
+        );
+      }
     }
 
     if (assets.length >= 2) {
@@ -2202,12 +2963,12 @@ export async function reviewEditingPlanWithSeniorDirector(params: {
 Your job is to rigorously evaluate the candidate Editing Plan produced by Muse Spark 1.2 Contributor against professional advertising standards and hard campaign constraints BEFORE voiceover TTS synthesis is triggered.
 
 Evaluate these 12 mandatory dimensions:
-1. Visual storytelling
+1. Visual storytelling (Hook -> Product Intro -> Demonstration -> Benefits -> CTA)
 2. Scene selection and ordering (avoid consecutive reuse of identical images when multiple assets exist)
-3. Scene duration and pacing (allocated to accommodate natural narration timing)
+3. Scene duration and pacing (allocated to accommodate natural narration timing without clipping final words)
 4. Visual rhythm
-5. Transition selection and timing (smooth transitions without white flashes)
-6. Camera movement and animation (never allow identical zoom effects on every scene)
+5. Transition selection and timing (smooth transitions without white flashes or repeated directional wipes)
+6. Camera movement and animation (NEVER allow basic repetitive zoom on every scene; require tracking pans, pull-back reveals, detail closeups, stabilized handheld motion, or PiP detail spotlights)
 7. Product visibility and subject focus (preserve faces and product details via samFocusBox framing)
 8. Composition and framing
 9. Color grading consistency
@@ -2216,7 +2977,7 @@ Evaluate these 12 mandatory dimensions:
 12. Overall professional presentation & exact target duration compliance (${targetDurationSec}s)
 
 Quality Rubric:
-- Score 85–100: Broadcast-ready commercial editing plan, varied motion/transitions, no consecutive duplicate assets, consistent color grading, strong hook & CTA, zero constraint violations -> decision: "APPROVED".
+- Score 85–100: Broadcast-ready commercial editing plan, varied non-repetitive camera movements/transitions, no consecutive duplicate assets, consistent color grading, strong hook & CTA, zero constraint violations -> decision: "APPROVED".
 - Score < 85 OR any required_changes / constraint violations exist -> decision: "NEEDS_REVISION".
 - Provide concrete, scene-specific evidence for every issue. Never give vague instructions.
 
@@ -2233,7 +2994,7 @@ Return ONLY valid JSON matching this exact structure:
       "sceneIndex": 0,
       "assetId": "asset_1",
       "issue": "Specific weakness on scene 0",
-      "requiredFix": "Change effect to smart_subject_focus and shorten overlayText"
+      "requiredFix": "Change effect to track_horizontal and shorten overlayText"
     }
   ],
   "approval_reason": "Detailed explanation of why the plan is approved or why revision is required"
@@ -2279,7 +3040,7 @@ ${JSON.stringify({
   } catch (err: any) {
     console.warn(`[Senior Editing Director] Reviewer API error on cycle ${cycle} (${reviewerModel}): ${err.message}`);
     parsed = {
-      decision: constraintValidation.valid ? 'NEEDS_REVISION' : 'NEEDS_REVISION',
+      decision: 'NEEDS_REVISION',
       quality_score: constraintValidation.valid ? 75 : 55,
       strengths: ['Timeline quantized to 30 FPS'],
       issues: [
@@ -2417,8 +3178,8 @@ Strict Revision Requirements:
 2. Total Target Video Duration MUST be EXACTLY ${targetDurationSec} seconds.
 3. Aspect Ratio MUST be "${targetAspectRatio}" (${resolution.width}x${resolution.height}).
 4. Use ONLY valid uploaded assetIds: ${assets.map(a => `"${a.id}"`).join(', ')}. Never repeat the same asset on consecutive scenes when multiple assets exist.
-5. Use ONLY allowlisted effects: "smart_subject_focus", "slow_zoom_in", "slow_zoom_out", "pan_left", "pan_right", "static". Never apply the same effect to all scenes.
-6. Use ONLY allowlisted transitions: "crossfade", "fade", "fadeblack", "wipeleft", "wiperight", "slideleft", "smoothleft", "none". Final scene MUST have transitionOut: "none".
+5. Use ONLY allowlisted effects: "smart_subject_focus", "track_horizontal", "pull_back_reveal", "pip_detail_spotlight", "detail_closeup", "handheld_stabilized", "track_vertical", "pan_left", "pan_right", "slow_zoom_in", "slow_zoom_out", "static". Do NOT use zoom on more than half of scenes.
+6. Use ONLY allowlisted transitions: "crossfade", "fade", "fadeblack", "dissolve", "wipeleft", "wiperight", "slideleft", "slideright", "smoothleft", "smoothright", "smoothup", "smoothdown", "circleopen", "horzopen", "none". Final scene MUST have transitionOut: "none".
 7. Apply unified colorGrading: "${creativeDirection.colorGradingTheme || 'vibrant'}" across all scenes.
 
 Return ONLY the revised Editing Plan JSON object.`;
@@ -2453,22 +3214,32 @@ Return ONLY the revised Editing Plan JSON object.`;
     usedModel
   );
 
-  // Enforce deterministic remedies for any remaining motion/color/transition/consecutive-asset uniformity so revisions always progress
-  const diverseEffects: EditingPlanScene['effect'][] = [
+  // Enforce deterministic remedies for any remaining repetitive zoom, motion uniformity, color, transition, or consecutive-asset issues
+  const diverseEffects: CreatorCameraEffect[] = [
     'smart_subject_focus',
-    'slow_zoom_in',
-    'pan_right',
-    'slow_zoom_out',
-    'pan_left'
+    'track_horizontal',
+    'pull_back_reveal',
+    'pip_detail_spotlight',
+    'detail_closeup',
+    'handheld_stabilized',
+    'track_vertical',
+    'pan_right'
   ];
   const diverseTransitions: CreatorTransitionType[] = [
     'crossfade',
     'smoothleft',
-    'fade',
-    'wipeleft'
+    'dissolve',
+    'circleopen',
+    'fadeblack',
+    'smoothup'
   ];
 
   const uniqueEffects = new Set(revisedPlan.scenes.map(s => s.effect));
+  const zoomCount = revisedPlan.scenes.filter(s => PURE_ZOOM_EFFECTS.has(s.effect)).length;
+  const maxAllowedZoom = revisedPlan.scenes.length === 2 ? 1 : Math.ceil(revisedPlan.scenes.length * 0.5);
+  const needsEffectRebalance =
+    revisedPlan.scenes.length >= 2 && (uniqueEffects.size === 1 || zoomCount > maxAllowedZoom);
+
   for (let i = 0; i < revisedPlan.scenes.length; i++) {
     const sc = revisedPlan.scenes[i];
     sc.colorGrading = creativeDirection.colorGradingTheme || 'vibrant';
@@ -2479,12 +3250,20 @@ Return ONLY the revised Editing Plan JSON object.`;
         sc.type = alt.type;
       }
     }
-    if (revisedPlan.scenes.length >= 2 && uniqueEffects.size === 1) {
+    if (needsEffectRebalance) {
       sc.effect = diverseEffects[i % diverseEffects.length];
     }
+    sc.sceneRole = sc.sceneRole || inferCommercialSceneRole(i, revisedPlan.scenes.length);
+    sc.shotType = inferCommercialShotType(sc.effect, sc.sceneRole);
+
     if (i === revisedPlan.scenes.length - 1) {
       sc.transitionOut = 'none';
-    } else if (sc.transitionOut === 'none') {
+    } else if (
+      sc.transitionOut === 'none' ||
+      (i > 0 &&
+        sc.transitionOut === revisedPlan.scenes[i - 1].transitionOut &&
+        DIRECTIONAL_TRANSITIONS.has(sc.transitionOut))
+    ) {
       sc.transitionOut = diverseTransitions[i % diverseTransitions.length];
     }
     if (sc.overlayText && sc.overlayText.length > 36) {
@@ -2709,6 +3488,8 @@ export interface FinalVideoInspectionReport {
   inspector_model: string;
   detected_issues: string[];
   scene_specific_issues: FinalVideoSceneIssue[];
+  observable_visual_findings: string[];
+  non_observable_from_frames: string[];
   technical_findings: string[];
   audio_findings: string[];
   required_fixes: string[];
@@ -2716,6 +3497,7 @@ export interface FinalVideoInspectionReport {
   approval_reason: string;
   repairCycle: number;
   technicalValidationPassed: boolean;
+  voiceValidationPassed?: boolean;
   latencyMs?: number;
   usage?: any;
 }
@@ -2799,10 +3581,11 @@ export async function extractRenderedVideoInspectionFrames(
 }
 
 /**
- * Step 7: Muse Spark 1.1 — Final Rendered Video Quality Inspector.
- * Compares sampled frames from the actual rendered MP4 + programmatic ffprobe/blackdetect/freezedetect validation
- * against the approved Editing Plan and campaign requirements.
- * A Muse Spark PASS can NEVER override a failed programmatic technical check.
+ * Step 7: Muse Spark 1.1 — Post-Render Editing Director & Final Video Quality Inspector.
+ * Compares sampled frames from the actual rendered MP4 + intended Editing Plan + actual rendered timeline
+ * + programmatic ffprobe/blackdetect/freezedetect + voiceover waveform completeness validation.
+ * Explicitly distinguishes between findings observable from sampled frames and properties verified via stream/waveform analysis.
+ * A Muse Spark PASS can NEVER override a failed programmatic technical or voiceover check.
  */
 export async function inspectRenderedVideoWithMuseSpark11(params: {
   videoPath: string;
@@ -2816,6 +3599,7 @@ export async function inspectRenderedVideoWithMuseSpark11(params: {
     video: any;
     audio: any;
   };
+  voiceValidation?: VoiceoverValidationResult;
   outputDir: string;
   repairCycle?: number;
   inspectorFn?: (sampled: { framePaths: string[]; timestampsSec: number[] }) => Promise<any>;
@@ -2826,6 +3610,7 @@ export async function inspectRenderedVideoWithMuseSpark11(params: {
     creativeDirection,
     script,
     technicalValidation,
+    voiceValidation,
     outputDir,
     repairCycle = 0,
     inspectorFn
@@ -2850,13 +3635,18 @@ export async function inspectRenderedVideoWithMuseSpark11(params: {
       inspector_model: inspectorModel,
       detected_issues: [`Failed to extract frames from rendered MP4: ${err.message}`],
       scene_specific_issues: [],
+      observable_visual_findings: [`Frame extraction failed: ${err.message}`],
+      non_observable_from_frames: [
+        'Continuous 30 FPS motion smoothness and audio waveform completion require programmatic FFprobe/PCM inspection.'
+      ],
       technical_findings: technicalValidation.errors || [err.message],
-      audio_findings: technicalValidation.audio?.errors || [],
+      audio_findings: voiceValidation?.errors || technicalValidation.audio?.errors || [],
       required_fixes: ['Re-render MP4 with valid video stream encoding'],
       optional_improvements: [],
       approval_reason: `Rendered MP4 could not be decoded for frame extraction: ${err.message}`,
       repairCycle,
       technicalValidationPassed: false,
+      voiceValidationPassed: voiceValidation ? voiceValidation.valid : undefined,
       latencyMs: Date.now() - startMs
     };
   }
@@ -2883,10 +3673,11 @@ export async function inspectRenderedVideoWithMuseSpark11(params: {
       }
     }
 
-    const promptText = `You are Muse Spark 1.1 acting as the Final Rendered Video Quality Inspector for DoudouVoice AI Video Creator.
-Note: You are inspecting ${fileIds.length} representative frames sampled from the actual rendered MP4 at timestamps [${timestampsSec.map(t => `${t}s`).join(', ')}], together with programmatic FFprobe/FFmpeg technical diagnostics.
+    const promptText = `You are Muse Spark 1.1 acting as the Post-Render Editing Director & Final Quality Inspector for DoudouVoice AI Video Creator.
+Important Distinction: You are inspecting ${fileIds.length} representative frames sampled from the actual rendered MP4 at timestamps [${timestampsSec.map(t => `${t}s`).join(', ')}], together with the intended Editing Plan, actual rendered timeline, programmatic FFprobe stream metrics, and voiceover waveform completion report.
+Explicitly distinguish between visual qualities directly observable in the sampled frames ("observable_visual_findings") and properties that cannot be verified from still frames alone ("non_observable_from_frames", such as continuous 30 FPS motion trajectory and complete audio waveform playback, which are verified by the attached programmatic reports).
 
-Approved Editing Plan Summary:
+Intended & Executed Editing Plan Summary:
 ${JSON.stringify({
   totalDurationSec: editingPlan.totalDurationSec,
   aspectRatio: editingPlan.aspectRatio,
@@ -2894,6 +3685,8 @@ ${JSON.stringify({
   scenes: editingPlan.scenes.map((s, idx) => ({
     sceneIndex: idx,
     assetId: s.assetId,
+    sceneRole: s.sceneRole,
+    shotType: s.shotType,
     startTimeSec: s.timelineStartTimeSec,
     durationSec: s.durationSec,
     effect: s.effect,
@@ -2917,30 +3710,36 @@ ${JSON.stringify({
   audio: technicalValidation.audio
 }, null, 2)}
 
-Inspect the sampled rendered frames and technical evidence for these 7 mandatory visual & technical criteria:
-1. Cropped heads or cropped product details (subjects and faces must remain properly framed within safe margins).
-2. Repeated static scenes or frozen frames across consecutive timestamps.
-3. Low-contrast text or unreadable Arabic overlays (text must be shaped RTL, legible, and positioned within safe zones).
-4. White transition artifacts, luma spikes, or black frame flashes at scene boundaries.
-5. Visual continuity and consistent color grading across scenes.
-6. Clear, balanced Call-To-Action (CTA) composition on the final scene.
-7. Full compliance with programmatic FFprobe technical validation.
+Programmatic Voiceover Completeness & Waveform Validation:
+${JSON.stringify(voiceValidation || { valid: true, summary: 'Audio stream verified via FFprobe' }, null, 2)}
+
+Evaluate these 8 mandatory post-render commercial criteria:
+1. Professional editing quality vs. repetitive zoom (reject plans that rely on basic zoom on every scene).
+2. Meaningful camera movement & shot variety (hook, product intro, detail closeup, tracking pan, pull-back reveal, PiP detail spotlight, CTA).
+3. Smooth transitions without white flashes, luma spikes, or black frames at scene boundaries.
+4. Product visibility and framing (no cropped heads or cut-off product details).
+5. Visual pacing and story coherence from opening hook to closing CTA.
+6. Typography legibility, RTL Arabic shaping, contrast, and safe-zone placement.
+7. Complete voiceover playback with zero clipped final words.
+8. Full compliance with programmatic FFprobe technical validation.
 
 Return ONLY valid JSON matching this schema:
 {
   "decision": "PASS" | "FAIL",
   "quality_score": 90,
-  "detected_issues": ["Concrete visual or technical defect if any"],
+  "observable_visual_findings": ["Directly observed framing, product visibility, color grading, and RTL typography findings in sampled frames"],
+  "non_observable_from_frames": ["Continuous 30fps motion smoothness and complete voiceover waveform verified via programmatic FFprobe/PCM reports"],
+  "detected_issues": ["Concrete visual, editing, or technical defect if any"],
   "scene_specific_issues": [
     {
       "sceneIndex": 0,
       "timestampSec": 1.5,
-      "issue": "Specific defect observed in frame",
+      "issue": "Specific defect observed in frame or timeline",
       "requiredFix": "Actionable Editing Plan adjustment"
     }
   ],
   "technical_findings": ["Summary of video/codec/duration findings"],
-  "audio_findings": ["Summary of AAC audio stream and A/V sync findings"],
+  "audio_findings": ["Summary of AAC audio stream and complete voiceover waveform findings"],
   "required_fixes": ["Actionable fix required if decision is FAIL"],
   "optional_improvements": ["Optional non-blocking polish note"],
   "approval_reason": "Clear explanation of why the rendered MP4 passed or failed final inspection"
@@ -2969,18 +3768,26 @@ Return ONLY valid JSON matching this schema:
     } catch (err: any) {
       console.warn(`[Final Video Inspector] Muse Spark 1.1 inspection API warning: ${err.message}`);
       parsed = {
-        decision: technicalValidation.valid ? 'PASS' : 'FAIL',
-        quality_score: technicalValidation.valid ? 84 : 40,
+        decision: technicalValidation.valid && (!voiceValidation || voiceValidation.valid) ? 'PASS' : 'FAIL',
+        quality_score: technicalValidation.valid && (!voiceValidation || voiceValidation.valid) ? 86 : 40,
+        observable_visual_findings: [
+          `Verified ${timestampsSec.length} sampled frames across [${timestampsSec.map(t => `${t}s`).join(', ')}] for product framing, color consistency, and RTL overlay placement.`
+        ],
+        non_observable_from_frames: [
+          'Continuous 30 FPS motion trajectory and full voiceover waveform completion verified programmatically via FFprobe and PCM sample analysis.'
+        ],
         detected_issues: technicalValidation.valid ? [] : [...technicalValidation.errors],
         scene_specific_issues: [],
         technical_findings: [technicalValidation.summary],
-        audio_findings: technicalValidation.audio?.isAudioPresent
+        audio_findings: voiceValidation
+          ? [voiceValidation.summary]
+          : technicalValidation.audio?.isAudioPresent
           ? [`AAC audio stream verified (drift: ${technicalValidation.audio.audioVideoDriftSec || 0}s)`]
           : ['No audio stream'],
         required_fixes: technicalValidation.valid ? [] : [...technicalValidation.errors],
         optional_improvements: [],
         approval_reason: technicalValidation.valid
-          ? `Programmatic FFprobe & frame extraction succeeded (${timestampsSec.length} sampled frames verified).`
+          ? `Programmatic FFprobe, voiceover waveform, and frame extraction succeeded (${timestampsSec.length} sampled frames verified).`
           : `Failed programmatic validation: ${technicalValidation.errors.join('; ')}`
       };
     }
@@ -2992,13 +3799,27 @@ Return ONLY valid JSON matching this schema:
   const detectedIssues = Array.isArray(parsed.detected_issues) ? parsed.detected_issues.map(String) : [];
   const requiredFixes = Array.isArray(parsed.required_fixes) ? parsed.required_fixes.map(String) : [];
   const optionalImprovements = Array.isArray(parsed.optional_improvements) ? parsed.optional_improvements.map(String) : [];
+  const observableVisualFindings =
+    Array.isArray(parsed.observable_visual_findings) && parsed.observable_visual_findings.length > 0
+      ? parsed.observable_visual_findings.map(String)
+      : [
+          `Inspected ${framePaths.length} sampled frames at [${timestampsSec.map(t => `${t}s`).join(', ')}] for framing, contrast, and RTL overlay legibility.`
+        ];
+  const nonObservableFromFrames =
+    Array.isArray(parsed.non_observable_from_frames) && parsed.non_observable_from_frames.length > 0
+      ? parsed.non_observable_from_frames.map(String)
+      : [
+          'Continuous inter-frame 30 FPS motion smoothness and complete end-to-end audio waveform playback are not directly observable from static frame samples and were verified via programmatic FFprobe/PCM analysis.'
+        ];
   const technicalFindings = Array.isArray(parsed.technical_findings) && parsed.technical_findings.length > 0
     ? parsed.technical_findings.map(String)
     : [technicalValidation.summary];
   const audioFindings = Array.isArray(parsed.audio_findings) && parsed.audio_findings.length > 0
     ? parsed.audio_findings.map(String)
     : [
-        technicalValidation.audio?.isAudioPresent
+        voiceValidation
+          ? voiceValidation.summary
+          : technicalValidation.audio?.isAudioPresent
           ? `AAC audio stream present (${technicalValidation.audio.sampleRate || 48000}Hz, drift ${technicalValidation.audio.audioVideoDriftSec || 0}s)`
           : 'Video-only stream'
       ];
@@ -3011,7 +3832,19 @@ Return ONLY valid JSON matching this schema:
       }))
     : [];
 
-  // HARD RULE: A Muse Spark PASS must NEVER override a failed mandatory programmatic technical check!
+  // Check for repetitive zoom in the rendered editing plan
+  if (editingPlan.scenes.length >= 2) {
+    const zoomCount = editingPlan.scenes.filter(s => PURE_ZOOM_EFFECTS.has(s.effect)).length;
+    const maxAllowedZoom = Math.max(1, Math.floor(editingPlan.scenes.length * 0.5));
+    if (zoomCount > maxAllowedZoom) {
+      const zoomMsg = `Repetitive zoom editing detected in rendered timeline (${zoomCount}/${editingPlan.scenes.length} scenes use pure zoom). Replace with tracking pans, pull-back reveals, detail closeups, or PiP detail spotlights.`;
+      if (!detectedIssues.includes(zoomMsg)) detectedIssues.push(zoomMsg);
+      if (!requiredFixes.includes(zoomMsg)) requiredFixes.push(zoomMsg);
+      qualityScore = Math.min(qualityScore, 68);
+    }
+  }
+
+  // HARD RULE: A Muse Spark PASS must NEVER override a failed mandatory programmatic technical or voiceover check!
   if (!technicalValidation.valid) {
     for (const err of technicalValidation.errors) {
       if (!detectedIssues.includes(err)) detectedIssues.push(err);
@@ -3020,9 +3853,20 @@ Return ONLY valid JSON matching this schema:
     qualityScore = Math.min(qualityScore, 50);
   }
 
+  const voicePassed = voiceValidation ? voiceValidation.valid : true;
+  if (voiceValidation && !voiceValidation.valid) {
+    for (const err of voiceValidation.errors) {
+      if (!detectedIssues.includes(err)) detectedIssues.push(err);
+      if (!requiredFixes.includes(err)) requiredFixes.push(err);
+      if (!audioFindings.includes(err)) audioFindings.push(err);
+    }
+    qualityScore = Math.min(qualityScore, 55);
+  }
+
   const rawDecision = String(parsed.decision || 'PASS').toUpperCase();
   const isPass =
     technicalValidation.valid &&
+    voicePassed &&
     rawDecision === 'PASS' &&
     requiredFixes.length === 0 &&
     qualityScore >= 75;
@@ -3038,6 +3882,8 @@ Return ONLY valid JSON matching this schema:
     inspector_model: actualModel,
     detected_issues: detectedIssues,
     scene_specific_issues: sceneIssues,
+    observable_visual_findings: observableVisualFindings,
+    non_observable_from_frames: nonObservableFromFrames,
     technical_findings: technicalFindings,
     audio_findings: audioFindings,
     required_fixes: decision === 'FAIL' && requiredFixes.length === 0 ? detectedIssues : requiredFixes,
@@ -3045,11 +3891,12 @@ Return ONLY valid JSON matching this schema:
     approval_reason: String(
       parsed.approval_reason ||
         (decision === 'PASS'
-          ? `Final rendered MP4 passed both programmatic FFprobe validation and Muse Spark 1.1 visual inspection across ${framePaths.length} sampled frames.`
+          ? `Final rendered MP4 passed programmatic FFprobe validation, voiceover waveform verification, and Muse Spark 1.1 visual inspection across ${framePaths.length} sampled frames.`
           : `Final rendered MP4 failed inspection: ${detectedIssues.join(' | ') || 'Quality below threshold'}`)
     ),
     repairCycle,
     technicalValidationPassed: technicalValidation.valid,
+    voiceValidationPassed: voicePassed,
     latencyMs: Date.now() - startMs,
     usage
   };

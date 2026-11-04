@@ -288,6 +288,7 @@ export default function AiVideoCreatorPage() {
   const [editingPlanReviewSummary, setEditingPlanReviewSummary] = useState<any>(null);
   const [selectedPlanVersionIndex, setSelectedPlanVersionIndex] = useState<number | null>(null);
   const [finalInspection, setFinalInspection] = useState<any>(null);
+  const [voiceValidation, setVoiceValidation] = useState<any>(null);
   const [validationData, setValidationData] = useState<any>(null);
   const [repairHistory, setRepairHistory] = useState<any[]>([]);
   const [finalReleaseStatus, setFinalReleaseStatus] = useState<'VERIFIED_AND_RELEASED' | 'UNAPPROVED_BEST_AVAILABLE' | ''>('');
@@ -295,6 +296,20 @@ export default function AiVideoCreatorPage() {
   const [finalVideoUrl, setFinalVideoUrl] = useState<string | null>(null);
   const [renderedVia, setRenderedVia] = useState<string>('');
   const [isModalFallback, setIsModalFallback] = useState<boolean>(false);
+  const [modalAppInfo, setModalAppInfo] = useState<any>(null);
+  const [modalStatus, setModalStatus] = useState<{
+    configured: boolean;
+    connected?: boolean;
+    appName: string;
+    workspace: string;
+    environment: string;
+    functionName: string;
+    expectedAppId: string;
+    resolvedAppId?: string;
+    functionId?: string;
+    requiredSecrets?: string[];
+    error?: string;
+  } | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [streamToken, setStreamToken] = useState<string>('');
   const [streamTokenExp, setStreamTokenExp] = useState<number>(0);
@@ -386,7 +401,26 @@ export default function AiVideoCreatorPage() {
       } catch (_) {}
     };
 
+    const checkModalStatus = async () => {
+      try {
+        const res = await fetch('/api/creator/modal-status?verify=true', {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          credentials: 'include',
+          cache: 'no-store'
+        });
+        const ct = res.headers.get('content-type') || '';
+        if (ct.includes('application/json') && res.ok) {
+          const data = await res.json();
+          if (data && data.appName) {
+            setModalStatus(data);
+          }
+        }
+      } catch (_) {}
+    };
+
     pingSession();
+    checkModalStatus();
     const interval = setInterval(pingSession, 90 * 1000);
     const onFocus = () => {
       if (document.visibilityState === 'visible') {
@@ -632,10 +666,12 @@ export default function AiVideoCreatorPage() {
     const plan = finalResult?.editingPlan || partial?.editingPlan;
     const reviewSummary = finalResult?.editingPlanReviewSummary || partial?.editingPlanReviewSummary;
     const inspection = finalResult?.finalInspection || partial?.finalInspection;
+    const voiceVal = finalResult?.voiceValidation || partial?.voiceValidation;
     const validation = finalResult?.validation || partial?.validation;
     const repairs = finalResult?.repairHistory || partial?.repairHistory || [];
     const releaseStatus = finalResult?.finalReleaseStatus ||
       (finalResult?.technicalValidationPassed !== false &&
+       (voiceVal ? voiceVal.valid !== false : true) &&
        (inspection ? inspection.decision === 'PASS' : true) &&
        (reviewSummary ? reviewSummary.finalDecision === 'APPROVED' : true)
         ? 'VERIFIED_AND_RELEASED'
@@ -653,12 +689,14 @@ export default function AiVideoCreatorPage() {
       setSelectedPlanVersionIndex(null);
     }
     if (inspection) setFinalInspection(inspection);
+    if (voiceVal) setVoiceValidation(voiceVal);
     if (validation) setValidationData(validation);
     if (Array.isArray(repairs)) setRepairHistory(repairs);
     setFinalReleaseStatus(releaseStatus);
     setFinalVideoUrl(finalResult?.finalVideoUrl || `/api/creator/stream/${targetProjectId}/final`);
-    setRenderedVia(finalResult?.renderedVia || 'Local Server FFmpeg');
+    setRenderedVia(finalResult?.renderedVia || 'Modal Cloud');
     setIsModalFallback(Boolean(finalResult?.isModalFallback));
+    if (finalResult?.modalAppInfo) setModalAppInfo(finalResult.modalAppInfo);
     setCurrentStage(9);
     setErrorMessage(null);
     if (releaseStatus === 'VERIFIED_AND_RELEASED') {
@@ -1165,6 +1203,7 @@ export default function AiVideoCreatorPage() {
             if (statusData.partial.script) setScriptData(statusData.partial.script);
             if (statusData.partial.editingPlan) setEditingPlan(statusData.partial.editingPlan);
             if (statusData.partial.editingPlanReviewSummary) setEditingPlanReviewSummary(statusData.partial.editingPlanReviewSummary);
+            if (statusData.partial.voiceValidation) setVoiceValidation(statusData.partial.voiceValidation);
             if (statusData.partial.finalInspection) setFinalInspection(statusData.partial.finalInspection);
             if (statusData.partial.repairHistory) setRepairHistory(statusData.partial.repairHistory);
           }
@@ -1278,12 +1317,23 @@ export default function AiVideoCreatorPage() {
             <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 text-xs font-bold border border-emerald-500/30 uppercase tracking-widest">
               BETA
             </span>
+            <span
+              className={`px-2.5 py-1 rounded-full text-xs font-mono font-bold border flex items-center gap-1.5 ${
+                modalStatus?.configured
+                  ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                  : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+              }`}
+              title={`Modal App: ${modalStatus?.appName || 'doudouvoice-media-edit'} • Function: ${modalStatus?.functionName || 'edit_media'} • Workspace: ${modalStatus?.workspace || 'abdelwadoudamirouche7'} (${modalStatus?.environment || 'main'}) • App ID: ${modalStatus?.expectedAppId || 'ap-PNNq10tlmnZUC85lShUIiM'}`}
+            >
+              <Cpu size={12} />
+              Modal: {modalStatus?.appName || 'doudouvoice-media-edit'}.{modalStatus?.functionName || 'edit_media'}
+            </span>
           </div>
           <h1 className="text-3xl font-extrabold text-white mt-2 flex items-center gap-3 tracking-tight">
             AI Video Creator
           </h1>
           <p className="text-sm text-white/50 mt-1 max-w-2xl">
-            Autonomous end-to-end video ad creation powered by multimodal intelligence, subject focus (LLM-estimated), expressive DoudouVoice dialect TTS, and Modal Cloud remote FFmpeg rendering.
+            Autonomous end-to-end video ad creation powered by multimodal intelligence, subject focus (LLM-estimated), expressive DoudouVoice dialect TTS, and Modal Cloud FFmpeg rendering (<code className="text-white/70 font-mono text-xs">doudouvoice-media-edit / edit_media</code>).
           </p>
         </div>
 
@@ -1867,15 +1917,31 @@ export default function AiVideoCreatorPage() {
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-mono text-white/80 bg-white/5 px-2.5 py-1 rounded border border-white/10">
-                    Engine: {renderedVia === 'Modal Cloud' ? '☁️ Modal Cloud (GPU Worker)' : isModalFallback ? '⚙️ Local Server FFmpeg (Modal Fallback)' : '⚙️ Local Server FFmpeg (Dedicated Engine)'}
+                    Engine: {renderedVia === 'Modal Cloud' ? `☁️ Modal Cloud (${modalAppInfo?.appName || 'doudouvoice-media-edit'}.${modalAppInfo?.functionName || 'edit_media'})` : isModalFallback ? '⚙️ Local Server FFmpeg (Modal Fallback)' : '⚙️ Local Server FFmpeg (Dedicated Engine)'}
                   </span>
                 </div>
               </div>
 
-              {/* 4 Distinct Pipeline Verification Badges */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+              {/* 5 Distinct Pipeline Verification Statuses */}
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-[11px]">
+                <div
+                  className={`p-2 rounded-lg border flex items-center justify-between ${
+                    voiceValidation?.valid !== false
+                      ? 'bg-emerald-500/10 border-emerald-500/25'
+                      : 'bg-red-500/10 border-red-500/30'
+                  }`}
+                >
+                  <span className="text-white/70 font-medium">Voice Validation</span>
+                  <span
+                    className={`font-mono font-bold ${
+                      voiceValidation?.valid !== false ? 'text-emerald-400' : 'text-red-400'
+                    }`}
+                  >
+                    {voiceValidation?.valid !== false ? 'PASS' : 'FAIL'}
+                  </span>
+                </div>
                 <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-between">
-                  <span className="text-white/70 font-medium">Render Completed</span>
+                  <span className="text-white/70 font-medium">Render Completion</span>
                   <span className="font-mono font-bold text-emerald-400">YES</span>
                 </div>
                 <div
@@ -1901,7 +1967,7 @@ export default function AiVideoCreatorPage() {
                       : 'bg-amber-500/10 border-amber-500/30'
                   }`}
                 >
-                  <span className="text-white/70 font-medium">AI Inspection (1.1)</span>
+                  <span className="text-white/70 font-medium">AI Visual Inspect</span>
                   <span
                     className={`font-mono font-bold ${
                       finalInspection?.decision === 'PASS' ? 'text-emerald-400' : 'text-amber-300'
@@ -1917,7 +1983,7 @@ export default function AiVideoCreatorPage() {
                       : 'bg-amber-500/10 border-amber-500/30'
                   }`}
                 >
-                  <span className="text-white/70 font-medium">Release Status</span>
+                  <span className="text-white/70 font-medium">Final Release</span>
                   <span
                     className={`font-mono font-bold ${
                       finalReleaseStatus === 'VERIFIED_AND_RELEASED' ? 'text-emerald-400' : 'text-amber-300'
@@ -2213,8 +2279,14 @@ export default function AiVideoCreatorPage() {
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <div className="p-3 rounded-lg bg-[#111] border border-white/10 flex flex-col gap-1.5">
-                        <span className="text-[10px] uppercase font-bold text-white/50">Technical &amp; Visual Findings</span>
-                        {Array.isArray(finalInspection.technical_findings) ? (
+                        <span className="text-[10px] uppercase font-bold text-white/50">Observable Visual Findings (Sampled Frames)</span>
+                        {Array.isArray(finalInspection.observable_visual_findings) && finalInspection.observable_visual_findings.length > 0 ? (
+                          <ul className="list-disc list-inside text-white/80 space-y-0.5 text-[11px]">
+                            {finalInspection.observable_visual_findings.map((f: string, idx: number) => (
+                              <li key={idx}>{f}</li>
+                            ))}
+                          </ul>
+                        ) : Array.isArray(finalInspection.technical_findings) ? (
                           <ul className="list-disc list-inside text-white/80 space-y-0.5 text-[11px]">
                             {finalInspection.technical_findings.map((f: string, idx: number) => (
                               <li key={idx}>{f}</li>
@@ -2226,7 +2298,7 @@ export default function AiVideoCreatorPage() {
                       </div>
 
                       <div className="p-3 rounded-lg bg-[#111] border border-white/10 flex flex-col gap-1.5">
-                        <span className="text-[10px] uppercase font-bold text-white/50">Audio &amp; Narration Sync Findings</span>
+                        <span className="text-[10px] uppercase font-bold text-white/50">Audio &amp; Non-Observable Stream Verification</span>
                         {Array.isArray(finalInspection.audio_findings) ? (
                           <ul className="list-disc list-inside text-white/80 space-y-0.5 text-[11px]">
                             {finalInspection.audio_findings.map((f: string, idx: number) => (
@@ -2234,7 +2306,13 @@ export default function AiVideoCreatorPage() {
                             ))}
                           </ul>
                         ) : (
-                          <p className="text-white/70 text-[11px]">AAC narration stream synchronized</p>
+                          <p className="text-white/70 text-[11px]">{voiceValidation?.summary || 'AAC narration stream synchronized'}</p>
+                        )}
+                        {Array.isArray(finalInspection.non_observable_from_frames) && finalInspection.non_observable_from_frames.length > 0 && (
+                          <div className="mt-1 pt-1.5 border-t border-white/5 text-[10px] text-white/45">
+                            <span className="font-semibold text-white/60">Verified via FFprobe/PCM (not frame-observable): </span>
+                            {finalInspection.non_observable_from_frames.join(' • ')}
+                          </div>
                         )}
                       </div>
                     </div>
@@ -2440,13 +2518,23 @@ export default function AiVideoCreatorPage() {
                             key={idx}
                             className="p-3 rounded-lg bg-[#111] border border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs"
                           >
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
                               <span className="font-bold text-white/60">Scene {idx + 1}</span>
+                              {sc.sceneRole && (
+                                <span className="text-[10px] font-mono uppercase text-emerald-300 bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20">
+                                  {sc.sceneRole.replace('_', ' ')}
+                                </span>
+                              )}
+                              {sc.shotType && (
+                                <span className="text-[10px] font-mono text-sky-300 bg-sky-500/10 px-1.5 py-0.5 rounded border border-sky-500/20">
+                                  {sc.shotType.replace('_', ' ')}
+                                </span>
+                              )}
                               <span className="font-mono text-brand-300 bg-brand-500/10 px-1.5 py-0.5 rounded border border-brand-500/20">
                                 {sc.timelineStartTimeSec.toFixed(1)}s - {(sc.timelineStartTimeSec + sc.durationSec).toFixed(1)}s
                               </span>
                               <span className="text-white/70 capitalize font-medium">
-                                Effect: {sc.effect?.replace('_', ' ')}
+                                Camera: {sc.effect?.replace(/_/g, ' ')}
                               </span>
                               {sc.samFocusBox && (
                                 <span className="text-[10px] text-purple-300 bg-purple-500/10 px-1.5 py-0.5 rounded border border-purple-500/20">

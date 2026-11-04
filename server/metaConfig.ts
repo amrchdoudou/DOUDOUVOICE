@@ -9,7 +9,8 @@ export const DEFAULT_META_INSPECTOR_MODEL = 'muse-spark-1.1';
 
 export const DEFAULT_META_MODEL = DEFAULT_META_CONTRIBUTOR_MODEL;
 export const DEFAULT_META_IMAGE_MODEL = DEFAULT_META_CONTRIBUTOR_MODEL;
-export const GEMINI_FALLBACK_MODEL = 'gemini-2.5-flash';
+export const GEMINI_FALLBACK_MODEL = 'gemini-3.8-flash';
+export const GEMINI_TRANSCRIBE_MODEL = 'gemini-3.5-transcribe';
 
 export function getMetaModel(): string {
   return process.env.META_MODEL || DEFAULT_META_CONTRIBUTOR_MODEL;

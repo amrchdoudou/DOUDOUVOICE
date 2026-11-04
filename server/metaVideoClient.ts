@@ -2,7 +2,14 @@ import { GoogleGenAI } from '@google/genai';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AiProviderType, MetaChatResponse } from './metaClient.js';
-import { getMetaModel, getMetaImageModel, isMetaStrict, GEMINI_FALLBACK_MODEL } from './metaConfig.js';
+import {
+  getMetaModel,
+  getMetaImageModel,
+  isMetaStrict,
+  GEMINI_FALLBACK_MODEL,
+  GEMINI_TRANSCRIBE_MODEL
+} from './metaConfig.js';
+import { getGeminiApiKeys } from './ttsKeyRotation.js';
 import { ExtractedFrame } from './videoService.js';
 
 export interface SceneAnalysis {
@@ -170,12 +177,19 @@ export class MetaVideoClient {
       throw new Error('META_STRICT is enabled and META_API_KEY is not configured. Gemini fallback is disabled.');
     }
 
-    const geminiKey = process.env.gemini_api_key1 || process.env.gemini_api_key2 || process.env.GEMINI_API_KEY;
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.gemini_api_key1 || process.env.gemini_api_key3;
     if (!geminiKey) {
       throw new Error('Neither META_API_KEY nor GEMINI_API_KEY is configured.');
     }
 
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    const ai = new GoogleGenAI({
+      apiKey: geminiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build'
+        }
+      }
+    });
     const systemMsg = messages.find(m => m.role === 'system')?.content || '';
     const userPrompt = messages.filter(m => m.role !== 'system').map(m => `${m.role.toUpperCase()}:\n${m.content}`).join('\n\n');
 
@@ -183,8 +197,7 @@ export class MetaVideoClient {
       model: GEMINI_FALLBACK_MODEL,
       contents: userPrompt,
       config: {
-        systemInstruction: systemMsg || undefined,
-        temperature
+        systemInstruction: systemMsg || undefined
       }
     });
 
@@ -347,10 +360,17 @@ Respond ONLY with valid JSON in this exact structure:
         }
 
         console.log('[MetaVideo] Calling Gemini Vision fallback for video scene analysis...');
-        const geminiKey = process.env.gemini_api_key1 || process.env.gemini_api_key2 || process.env.GEMINI_API_KEY;
+        const geminiKey = process.env.GEMINI_API_KEY || process.env.gemini_api_key1 || process.env.gemini_api_key3;
         if (!geminiKey) throw new Error('No AI API key available for video analysis.');
 
-        const ai = new GoogleGenAI({ apiKey: geminiKey });
+        const ai = new GoogleGenAI({
+          apiKey: geminiKey,
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build'
+            }
+          }
+        });
         const parts: any[] = [];
 
         for (const frame of selectedFrames) {
@@ -725,7 +745,8 @@ Rules:
   }
 
   /**
-   * Mode C: Transcribes audio speech and localizes/adapts it into target dialect.
+   * Mode C: Transcribes audio speech via gemini-3.5-transcribe and localizes/adapts it into target dialect
+   * using Meta Muse Spark (muse-spark-1.2-contributor) or Gemini fallback.
    */
   async localizeExistingAudio(params: {
     audioWavPath: string;
@@ -733,7 +754,8 @@ Rules:
     targetVoice: string;
     durationSec: number;
   }): Promise<VideoLocalizationResult> {
-    const { audioWavPath, targetDialect, targetVoice } = params;
+    const { audioWavPath, targetDialect, targetVoice, durationSec } = params;
+    const safeDuration = Math.max(5, Math.round(durationSec || 15));
 
     try {
       if (isMetaStrict() && !this.apiKey) {
@@ -765,67 +787,136 @@ Rules:
         fs.promises.unlink(tempCompressedPath).catch(() => {});
       }
 
-      const geminiKey = process.env.gemini_api_key1 || process.env.gemini_api_key2 || process.env.GEMINI_API_KEY;
-      if (!geminiKey) throw new Error('No Gemini API key available.');
+      const availableKeys = getGeminiApiKeys().filter(k => k.name !== 'gemini_api_key2');
+      if (availableKeys.length === 0) {
+        throw new Error('No Gemini API key available for audio transcription.');
+      }
 
-      const ai = new GoogleGenAI({ apiKey: geminiKey });
+      // Step 1: Transcribe the audio speech using gemini-3.5-transcribe
+      let rawTranscript = '';
+      let lastTranscribeErr: any = null;
 
-      const prompt = `Listen to the audio track from a video.
-1. Transcribe the original speech into text with approximate start and end timestamps (seconds).
-2. Translate and localize the speech content into spoken "${targetDialect}". Keep the translation natural and faithful to the original emotional intensity.
-3. Make sure the translated segments fit within the original time slots.
+      for (const keyObj of availableKeys.slice(0, 4)) {
+        try {
+          const ai = new GoogleGenAI({
+            apiKey: keyObj.value,
+            httpOptions: {
+              headers: {
+                'User-Agent': 'aistudio-build'
+              }
+            }
+          });
 
-Respond ONLY with valid JSON:
+          const transcribeRes = await ai.models.generateContent({
+            model: GEMINI_TRANSCRIBE_MODEL,
+            contents: {
+              parts: [
+                {
+                  inlineData: {
+                    data: base64Audio,
+                    mimeType: 'audio/wav'
+                  }
+                },
+                { text: 'Transcribe this audio.' }
+              ]
+            }
+          });
+
+          const parts = transcribeRes.candidates?.[0]?.content?.parts || [];
+          const extractedParts: string[] = [];
+          for (const p of parts as any[]) {
+            if (p?.audioTranscription?.text) {
+              extractedParts.push(String(p.audioTranscription.text).trim());
+            } else if (typeof p?.text === 'string' && p.text.trim()) {
+              extractedParts.push(p.text.trim());
+            }
+          }
+          rawTranscript = extractedParts.join(' ').trim();
+          if (!rawTranscript && typeof transcribeRes.text === 'string') {
+            rawTranscript = transcribeRes.text.trim();
+          }
+          if (rawTranscript) {
+            console.log(`[MetaVideo] Audio transcribed via ${GEMINI_TRANSCRIBE_MODEL} (${keyObj.name}): "${rawTranscript.slice(0, 120)}..."`);
+            break;
+          }
+        } catch (err: any) {
+          lastTranscribeErr = err;
+          console.warn(`[MetaVideo] ${GEMINI_TRANSCRIBE_MODEL} attempt with ${keyObj.name} failed:`, err?.message || err);
+        }
+      }
+
+      // Step 2: Use Meta Muse Spark (via callMetaChat) to segment & localize the transcript into targetDialect
+      const localizeSystemPrompt = `You are an expert audiovisual translator and commercial voiceover localization director.
+Your task is to take a transcribed video audio track (total video duration: ${safeDuration} seconds) and:
+1. Segment the original transcript into clean, natural time-coded segments between 0 and ${safeDuration} seconds.
+2. Translate and localize each segment into authentic, natural spoken "${targetDialect}" that fits comfortably within each segment's time window (approx. 2.0-2.5 words per second).
+3. Keep the translation natural, colloquial, and faithful to the original commercial energy.
+
+Respond ONLY with valid JSON in this exact format:
 {
   "originalTranscript": [
-    { "startTimeSec": 0, "endTimeSec": 3, "speaker": "Speaker 1", "text": "Original transcript" }
+    { "startTimeSec": 0, "endTimeSec": 3.5, "speaker": "Speaker 1", "text": "Original spoken line" }
   ],
   "localizedSegments": [
     {
       "id": "loc-1",
       "startTimeSec": 0,
-      "endTimeSec": 3,
-      "text": "Localized speech in ${targetDialect}",
-      "emotion": "neutral",
+      "endTimeSec": 3.5,
+      "text": "Localized spoken line in ${targetDialect}",
+      "emotion": "excited",
       "pace": "normal"
     }
   ]
 }`;
 
-      const response = await ai.models.generateContent({
-        model: GEMINI_FALLBACK_MODEL,
-        contents: [
-          {
-            inlineData: {
-              data: base64Audio,
-              mimeType: 'audio/wav'
-            }
-          },
-          { text: prompt }
-        ],
-        config: { responseMimeType: 'application/json' }
-      });
+      const localizeUserPrompt = rawTranscript
+        ? `VIDEO DURATION: ${safeDuration} seconds
+TARGET DIALECT: ${targetDialect}
+RAW AUDIO TRANSCRIPT:
+"""
+${rawTranscript}
+"""
 
-      const parsed = extractJson(response.text || '{}');
+Break the transcript into time-coded segments spanning 0s to ${safeDuration}s and localize every segment into spoken ${targetDialect} as pure JSON.`
+        : `VIDEO DURATION: ${safeDuration} seconds
+TARGET DIALECT: ${targetDialect}
+NOTE: The audio track contained minimal or unclear speech. Generate 3 time-coded commercial voiceover segments spanning 0s to ${safeDuration}s in spoken ${targetDialect} as pure JSON.`;
+
+      const chatRes = await this.callMetaChat(
+        [
+          { role: 'system', content: localizeSystemPrompt },
+          { role: 'user', content: localizeUserPrompt }
+        ],
+        0.3
+      );
+
+      const content = chatRes.data?.choices?.[0]?.message?.content || '';
+      const parsed = extractJson(content);
 
       const localizedSegments: VoiceoverSegment[] = Array.isArray(parsed.localizedSegments)
-        ? parsed.localizedSegments.map((s: any, idx: number) => ({
-            id: s.id || `loc-${idx + 1}`,
-            sceneId: s.sceneId,
-            startTimeSec: typeof s.startTimeSec === 'number' ? s.startTimeSec : idx * 3,
-            endTimeSec: typeof s.endTimeSec === 'number' ? s.endTimeSec : (idx + 1) * 3,
-            text: String(s.text || '').trim(),
-            dialect: targetDialect,
-            voice: targetVoice,
-            emotion: s.emotion || 'neutral',
-            pace: s.pace || 'normal'
-          }))
+        ? parsed.localizedSegments
+            .map((s: any, idx: number) => ({
+              id: s.id || `loc-${idx + 1}`,
+              sceneId: s.sceneId,
+              startTimeSec: typeof s.startTimeSec === 'number' ? s.startTimeSec : idx * 3,
+              endTimeSec: typeof s.endTimeSec === 'number' ? s.endTimeSec : Math.min(safeDuration, (idx + 1) * 3),
+              text: String(s.text || '').trim(),
+              dialect: targetDialect,
+              voice: targetVoice,
+              emotion: s.emotion || 'neutral',
+              pace: s.pace || 'normal'
+            }))
+            .filter((s: VoiceoverSegment) => s.text.length > 0)
         : [];
 
+      if (localizedSegments.length === 0 && lastTranscribeErr) {
+        throw lastTranscribeErr;
+      }
+
       return {
-        success: true,
-        provider: 'gemini-fallback',
-        model: GEMINI_FALLBACK_MODEL,
+        success: localizedSegments.length > 0,
+        provider: chatRes.provider || 'meta',
+        model: `${GEMINI_TRANSCRIBE_MODEL} + ${chatRes.model || this.model}`,
         originalTranscript: Array.isArray(parsed.originalTranscript) ? parsed.originalTranscript : [],
         localizedSegments
       };
@@ -833,8 +924,8 @@ Respond ONLY with valid JSON:
       console.error('[MetaVideo] localizeExistingAudio error:', err);
       return {
         success: false,
-        provider: 'gemini-fallback',
-        model: GEMINI_FALLBACK_MODEL,
+        provider: 'meta',
+        model: GEMINI_TRANSCRIBE_MODEL,
         originalTranscript: [],
         localizedSegments: [],
         error: err.message || 'Audio localization failed'

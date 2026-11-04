@@ -228,7 +228,7 @@ export class MetaClient {
     this.baseUrl = (options?.baseUrl || process.env.META_BASE_URL || 'https://api.meta.ai/v1').replace(/\/+$/, '');
     this.explicitModel = options?.model;
     this.explicitImageModel = options?.imageModel;
-    this.timeoutMs = options?.timeoutMs || 45000;
+    this.timeoutMs = options?.timeoutMs || 65000;
   }
 
   private get apiKey(): string {
@@ -730,7 +730,7 @@ Generate the grounded advertising script now as pure JSON.`;
             const waitMs = Number.isFinite(retrySec) && retrySec > 0
               ? Math.min(15000, Math.round(retrySec * 1000))
               : Math.min(10000, 1500 * Math.pow(2, attempt));
-            console.warn(`[MetaClient] Transient HTTP ${res.status} on ${targetModel} (attempt ${attempt + 1}/${maxRetries + 1}). Retrying in ${waitMs}ms...`);
+            console.log(`[MetaClient] Transient HTTP ${res.status} on ${targetModel} (attempt ${attempt + 1}/${maxRetries + 1}). Retrying in ${waitMs}ms...`);
             await new Promise(r => setTimeout(r, waitMs));
             continue;
           }
@@ -738,7 +738,7 @@ Generate the grounded advertising script now as pure JSON.`;
           if (strict) {
             throw new Error(`Meta AI chat completion failed (${res.status}): ${errorDetail}`);
           }
-          console.warn(`[MetaClient] Meta API endpoint returned ${res.status}. Falling back to Gemini...`);
+          console.log(`[MetaClient] Meta API endpoint returned ${res.status}. Falling back to Gemini...`);
           return await this.callGeminiFallback(messages, temperature);
         }
 
@@ -746,7 +746,7 @@ Generate the grounded advertising script now as pure JSON.`;
           if (strict) {
             throw new Error(`Meta AI API returned non-JSON response (${contentType}).`);
           }
-          console.warn(`[MetaClient] Meta API returned non-JSON (${contentType}). Falling back to Gemini...`);
+          console.log(`[MetaClient] Meta API returned non-JSON (${contentType}). Falling back to Gemini...`);
           return await this.callGeminiFallback(messages, temperature);
         }
 
@@ -760,10 +760,10 @@ Generate the grounded advertising script now as pure JSON.`;
         };
       } catch (err: any) {
         lastErr = err;
-        const isAbortOrNetwork = err?.name === 'AbortError' || /fetch|network|timeout|socket/i.test(err?.message || '');
+        const isAbortOrNetwork = err?.name === 'AbortError' || /fetch|network|timeout|socket|aborted/i.test(err?.message || '');
         if (isAbortOrNetwork && attempt < maxRetries) {
           const waitMs = Math.min(8000, 1500 * Math.pow(2, attempt));
-          console.warn(`[MetaClient] Network/timeout error on ${targetModel} (attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}. Retrying in ${waitMs}ms...`);
+          console.log(`[MetaClient] Transient timeout/network retry on ${targetModel} (attempt ${attempt + 1}/${maxRetries + 1}). Retrying in ${waitMs}ms...`);
           await new Promise(r => setTimeout(r, waitMs));
           continue;
         }
@@ -774,7 +774,7 @@ Generate the grounded advertising script now as pure JSON.`;
               : `Meta AI request failed: ${err.message}`
           );
         }
-        console.warn(`[MetaClient] Meta API request failed: ${err.message}. Falling back to Gemini...`);
+        console.log(`[MetaClient] Meta API request failed: ${err.message}. Falling back to Gemini...`);
         return await this.callGeminiFallback(messages, temperature);
       } finally {
         clearTimeout(timer);
@@ -916,7 +916,7 @@ Generate the grounded advertising script now as pure JSON.`;
             const waitMs = Number.isFinite(retrySec) && retrySec > 0
               ? Math.min(15000, Math.round(retrySec * 1000))
               : Math.min(10000, 1500 * Math.pow(2, attempt));
-            console.warn(`[MetaClient] Transient HTTP ${res.status} on Responses API (${targetModel}, attempt ${attempt + 1}/${maxRetries + 1}). Retrying in ${waitMs}ms...`);
+            console.log(`[MetaClient] Transient HTTP ${res.status} on Responses API (${targetModel}, attempt ${attempt + 1}/${maxRetries + 1}). Retrying in ${waitMs}ms...`);
             await new Promise(r => setTimeout(r, waitMs));
             continue;
           }
@@ -933,10 +933,10 @@ Generate the grounded advertising script now as pure JSON.`;
         };
       } catch (err: any) {
         lastErr = err;
-        const isAbortOrNetwork = err?.name === 'AbortError' || /fetch|network|timeout|socket/i.test(err?.message || '');
+        const isAbortOrNetwork = err?.name === 'AbortError' || /fetch|network|timeout|socket|aborted/i.test(err?.message || '');
         if (isAbortOrNetwork && attempt < maxRetries) {
           const waitMs = Math.min(8000, 1500 * Math.pow(2, attempt));
-          console.warn(`[MetaClient] Multimodal Responses API network/timeout (${targetModel}, attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}. Retrying in ${waitMs}ms...`);
+          console.log(`[MetaClient] Multimodal Responses API transient retry (${targetModel}, attempt ${attempt + 1}/${maxRetries + 1}). Retrying in ${waitMs}ms...`);
           await new Promise(r => setTimeout(r, waitMs));
           continue;
         }
@@ -949,12 +949,19 @@ Generate the grounded advertising script now as pure JSON.`;
     throw lastErr || new Error(`Meta Responses API failed after ${maxRetries + 1} attempts.`);
   }
 
-  private async callGeminiFallback(messages: Array<{ role: string; content: string }>, temperature = 0.4): Promise<MetaChatResponse> {
-    const geminiKey = process.env.gemini_api_key1 || process.env.gemini_api_key2 || process.env.GEMINI_API_KEY;
+  private async callGeminiFallback(messages: Array<{ role: string; content: string }>, _temperature = 0.4): Promise<MetaChatResponse> {
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.gemini_api_key1 || process.env.gemini_api_key3;
     if (!geminiKey) {
       throw new Error('No Gemini or Meta API key is available in the environment.');
     }
-    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    const ai = new GoogleGenAI({
+      apiKey: geminiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build'
+        }
+      }
+    });
 
     const systemMsg = messages.find(m => m.role === 'system')?.content || '';
     const otherMsgs = messages.filter(m => m.role !== 'system');
@@ -964,8 +971,7 @@ Generate the grounded advertising script now as pure JSON.`;
       model: GEMINI_FALLBACK_MODEL,
       contents: promptText,
       config: {
-        systemInstruction: systemMsg,
-        temperature,
+        systemInstruction: systemMsg || undefined,
         responseMimeType: 'application/json'
       }
     });
