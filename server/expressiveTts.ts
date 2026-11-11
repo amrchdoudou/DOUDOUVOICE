@@ -1,6 +1,6 @@
 /**
  * Experimental Expressive TTS and Timing Engine
- * Isolated testing module using gemini-3.1-flash-tts-preview
+ * Isolated testing module using gemini-3.8-flash-tts
  * Supports:
  * - Independent segment generation with pacing directives ([pace: slow], [pace: normal], [pace: fast])
  * - True digital silence pauses ([pause: 1s], [pause: 3s], [pause: 1.5s])
@@ -13,10 +13,43 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 import { parseTestScript, ParsedSegment, SpeechSegment, SoundSegment } from '../src/lib/scriptParser.js';
+import { GEMINI_TTS_MODEL } from './metaConfig.js';
 
 const SAMPLE_RATE = 24000;
 const BYTES_PER_SAMPLE = 2; // 16-bit mono
 const BYTES_PER_SECOND = SAMPLE_RATE * BYTES_PER_SAMPLE; // 48000 bytes/sec
+
+/**
+ * Extracts raw 24kHz 16-bit mono PCM audio bytes from a Gemini TTS audio response buffer.
+ * Gemini 3.8 TTS unary generateContent returns a RIFF/WAVE container (including fmt, data, and trailing C2PA chunks),
+ * whereas streaming or mock responses may return raw L16 PCM bytes directly.
+ */
+export function extractRawPcmFromTtsAudio(audioBuffer: Buffer): Buffer {
+  if (
+    audioBuffer.length >= 44 &&
+    audioBuffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    audioBuffer.subarray(8, 12).toString('ascii') === 'WAVE'
+  ) {
+    let offset = 12;
+    while (offset + 8 <= audioBuffer.length) {
+      const chunkId = audioBuffer.subarray(offset, offset + 4).toString('ascii');
+      const chunkSize = audioBuffer.readUInt32LE(offset + 4);
+      const dataStart = offset + 8;
+      if (chunkId === 'data') {
+        const dataEnd = Math.min(audioBuffer.length, dataStart + chunkSize);
+        const pcmSlice = audioBuffer.subarray(dataStart, dataEnd);
+        const evenLen = pcmSlice.length - (pcmSlice.length % 2);
+        return Buffer.from(pcmSlice.subarray(0, evenLen));
+      }
+      offset = dataStart + chunkSize + (chunkSize % 2);
+    }
+    const fallbackSlice = audioBuffer.subarray(44);
+    const evenLen = fallbackSlice.length - (fallbackSlice.length % 2);
+    return Buffer.from(fallbackSlice.subarray(0, evenLen));
+  }
+  const evenLen = audioBuffer.length - (audioBuffer.length % 2);
+  return evenLen === audioBuffer.length ? audioBuffer : Buffer.from(audioBuffer.subarray(0, evenLen));
+}
 
 export function addWavHeader(pcmBuffer: Buffer, sampleRate = 24000, numChannels = 1, bitsPerSample = 16): Buffer {
   const header = Buffer.alloc(44);
@@ -179,49 +212,41 @@ export async function generateSingleSegmentAudio(
     throw new Error('No Gemini API key available for speech generation.');
   }
 
-  let prompt = '';
+  let styleMetadata = '';
   if (segment.type === 'speech') {
     if (isKabyle) {
       const regionKey = (kabyleRegion && KABYLE_REGION_HINTS[kabyleRegion]) ? kabyleRegion : 'default';
       const regionHint = KABYLE_REGION_HINTS[regionKey];
 
-      prompt = `You are a native Algerian Kabyle (Taqbaylit) speaker. Speak the following text in natural, spoken, conversational Kabyle like chatting with a friend or presenting a lively local ad, never in a stiff news-reader tone.
-Strictly DO NOT read this as Modern Standard Arabic, Algerian Arabic Darija, or French. Pronounce all authentic Kabyle phonemes accurately: pharyngeals (ḥ, ɛ), emphatics (ṭ, ḍ, ṣ, ẓ), and ɣ; spirantize stops; articulate "ǧ" and "č" distinctly; and respect geminated consonants.
-${regionHint}
-${styleInstruction}
-${paceInstruction}
-${pitchHint}
-
-<<<TEXT_TO_SPEAK_START>>>
-${segment.text}
-<<<TEXT_TO_SPEAK_END>>>`;
+      styleMetadata = [
+        'Native Algerian Kabyle (Taqbaylit) speaker. Speak in natural, spoken, conversational Kabyle — never Modern Standard Arabic, Algerian Darija, or French.',
+        'Pronounce all authentic Kabyle phonemes accurately: pharyngeals (ḥ, ɛ), emphatics (ṭ, ḍ, ṣ, ẓ), and ɣ; spirantize stops; articulate "ǧ" and "č" distinctly.',
+        regionHint,
+        styleInstruction,
+        paceInstruction,
+        pitchHint
+      ].filter(Boolean).join(' ');
     } else if (isEnglish) {
       const accent = dialect === 'British English (UK)'
         ? 'British English (UK / RP / Modern British) accent with clear diction and natural cadence'
         : 'crisp, engaging American English (US) accent with natural commercial cadence';
 
-      prompt = `You are a professional voice-over artist and native speaker of English.
-Speak with a natural, ${accent}.
-${styleInstruction}
-${paceInstruction}
-${pitchHint}
-
-<<<TEXT_TO_SPEAK_START>>>
-${segment.text}
-<<<TEXT_TO_SPEAK_END>>>`;
+      styleMetadata = [
+        `Professional native English voice-over artist with a natural ${accent}.`,
+        styleInstruction,
+        paceInstruction,
+        pitchHint
+      ].filter(Boolean).join(' ');
     } else {
       const dialectHint = DIALECT_HINTS[safeDialect] || '';
 
-      prompt = `You are a native ${safeDialect} speaker.
-Please speak the following text in natural ${safeDialect}. DO NOT read it as Modern Standard Arabic (Fusha) under any circumstances. Adopt a strong, authentic native ${safeDialect} accent.
-${dialectHint}
-${styleInstruction}
-${paceInstruction}
-${pitchHint}
-
-<<<TEXT_TO_SPEAK_START>>>
-${segment.text}
-<<<TEXT_TO_SPEAK_END>>>`;
+      styleMetadata = [
+        `Native ${safeDialect} speaker. Speak in natural ${safeDialect} with a strong, authentic regional accent — strictly NOT Modern Standard Arabic (Fusha).`,
+        dialectHint,
+        styleInstruction,
+        paceInstruction,
+        pitchHint
+      ].filter(Boolean).join(' ');
     }
   } else if (segment.type === 'sound') {
     if (isEnglish) {
@@ -236,12 +261,7 @@ ${segment.text}
         expressionInstruction = 'Expressive vocalization: Deliver with strong natural feeling in natural English.';
       }
 
-      prompt = `You are an expressive native English speaker and voice artist.
-${expressionInstruction}
-
-<<<TEXT_TO_SPEAK_START>>>
-${segment.text}
-<<<TEXT_TO_SPEAK_END>>>`;
+      styleMetadata = `Expressive native English speaker and voice artist. ${expressionInstruction}`;
     } else {
       let expressionInstruction = '';
       if (segment.soundType === 'excited') {
@@ -254,12 +274,7 @@ ${segment.text}
         expressionInstruction = 'Expressive vocalization: Deliver with strong natural feeling.';
       }
 
-      prompt = `You are an expressive native ${dialect} speaker.
-${expressionInstruction}
-
-<<<TEXT_TO_SPEAK_START>>>
-${segment.text}
-<<<TEXT_TO_SPEAK_END>>>`;
+      styleMetadata = `Expressive native ${dialect} speaker. ${expressionInstruction}`;
     }
   }
 
@@ -277,14 +292,33 @@ ${segment.text}
     for (let i = 0; i < keys.length; i++) {
       const tryIdx = (startIdx + i) % keys.length;
       const keyObj = keys[tryIdx];
-      const ai = new GoogleGenAI({ apiKey: keyObj.value });
+      const ai = new GoogleGenAI({
+        apiKey: keyObj.value,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
 
       try {
         response = await ai.models.generateContent({
-          model: "gemini-3.1-flash-tts-preview",
-          contents: [{ parts: [{ text: prompt }] }],
+          model: GEMINI_TTS_MODEL,
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: segment.text,
+                  speechMetadata: {
+                    style: styleMetadata,
+                  },
+                },
+              ],
+            },
+          ],
           config: {
-            responseModalities: ["audio" as any],
+            responseModalities: ["AUDIO"],
             speechConfig: {
               voiceConfig: {
                 prebuiltVoiceConfig: { voiceName: voice || 'Puck' }
@@ -299,23 +333,29 @@ ${segment.text}
       } catch (err: any) {
         lastErr = err;
         const msg = (err.message || "").toLowerCase();
-        if (
-          keys.length > 1 &&
-          (msg.includes("quota") ||
-            msg.includes("limit") ||
-            msg.includes("exhausted") ||
-            msg.includes("429") ||
-            msg.includes("403") ||
-            msg.includes("401") ||
-            msg.includes("permission") ||
-            msg.includes("forbidden") ||
-            msg.includes("leaked") ||
-            msg.includes("invalid") ||
-            err.status === 429 ||
-            err.status === 403 ||
-            err.status === 401)
-        ) {
-          console.warn(`[Expressive TTS] Key ${keyObj.name} failed (${err.status || 'key error'}) on segment ${segment.id}, trying next key...`);
+        const isTransient503 =
+          err.status === 503 ||
+          msg.includes("503") ||
+          msg.includes("unavailable") ||
+          msg.includes("high demand") ||
+          msg.includes("overloaded");
+        const isKeyOrRateErr =
+          msg.includes("quota") ||
+          msg.includes("limit") ||
+          msg.includes("exhausted") ||
+          msg.includes("429") ||
+          msg.includes("403") ||
+          msg.includes("401") ||
+          msg.includes("permission") ||
+          msg.includes("forbidden") ||
+          msg.includes("leaked") ||
+          msg.includes("invalid") ||
+          err.status === 429 ||
+          err.status === 403 ||
+          err.status === 401;
+
+        if (isTransient503 || (keys.length > 1 && isKeyOrRateErr)) {
+          console.warn(`[Expressive TTS] Key ${keyObj.name} failed (${err.status || 'transient/key error'}) on segment ${segment.id}, retrying...`);
           continue;
         } else {
           throw err;
@@ -337,7 +377,7 @@ ${segment.text}
     throw new Error(`Failed to generate audio for segment ${segment.id}`);
   }
 
-  const rawPcm = Buffer.from(base64Audio, 'base64');
+  const rawPcm = extractRawPcmFromTtsAudio(Buffer.from(base64Audio, 'base64'));
   const durationSec = Number((rawPcm.length / BYTES_PER_SECOND).toFixed(2));
   
   // Save standalone WAV for previewing this individual segment

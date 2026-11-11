@@ -471,7 +471,7 @@ export default function VideoStudio() {
     }
   };
 
-  // Step 4: Generate Voiceover ONLY after User Approval (Gemini 3.1 Flash TTS)
+  // Step 4: Generate Voiceover ONLY after User Approval (Gemini 3.8 Flash TTS)
   const handleGenerateVoiceover = async () => {
     if (!currentProject || !user) return;
     setIsGeneratingVoiceover(true);
@@ -1402,7 +1402,7 @@ export default function VideoStudio() {
                   {isGeneratingVoiceover ? (
                     <>
                       <Loader2 size={16} className="animate-spin" />
-                      <span>{language === 'ar' ? 'جاري توليد الصوت لكافة المقاطع عبر Gemini 3.1 Flash TTS...' : 'Synthesizing Speech for All Segments (Gemini 3.1 Flash TTS)...'}</span>
+                      <span>{language === 'ar' ? 'جاري توليد الصوت لكافة المقاطع عبر Gemini 3.8 Flash TTS...' : 'Synthesizing Speech for All Segments (Gemini 3.8 Flash TTS)...'}</span>
                     </>
                   ) : (
                     <>

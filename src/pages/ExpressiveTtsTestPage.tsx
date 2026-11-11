@@ -225,7 +225,7 @@ export default function ExpressiveTtsTestPage() {
               <span className="px-2.5 py-0.5 rounded-full bg-amber-500/20 border border-amber-500/30 text-amber-300 text-[10px] font-mono uppercase tracking-wider font-bold">
                 Phase 1 Experiment
               </span>
-              <span className="text-white/40 text-xs font-mono">gemini-3.1-flash-tts-preview</span>
+              <span className="text-white/40 text-xs font-mono">gemini-3.8-flash-tts</span>
             </div>
             <h1 className="text-xl md:text-2xl font-black tracking-tight text-white flex items-center gap-2">
               <Sparkles className="text-brand-400" size={22} />

@@ -11,6 +11,8 @@ import { GoogleGenAI } from '@google/genai';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { GEMINI_TTS_MODEL } from './metaConfig.js';
+import { extractRawPcmFromTtsAudio } from './expressiveTts.js';
 
 export interface GenerateSegmentRequest {
   type: 'speech' | 'sound';
@@ -95,25 +97,20 @@ export class ExperimentTtsService {
       throw new Error('Segment text is required.');
     }
 
-    // Build specialized prompt depending on whether it is a speech segment or vocal reaction
-    let prompt = '';
+    // Build specialized style metadata depending on whether it is a speech segment or vocal reaction
+    let styleMetadata = '';
     if (params.type === 'sound') {
       const soundType = params.soundType || 'excited';
       let expressionDirective = '';
       if (soundType === 'excited') {
-        expressionDirective = 'Vocal Reaction: Exclaim with vivid, thrilled excitement, high enthusiasm, and energetic vocal punch! Only produce the reaction.';
+        expressionDirective = 'Vocal Reaction: Exclaim with vivid, thrilled excitement, high enthusiasm, and energetic vocal punch!';
       } else if (soundType === 'surprised') {
-        expressionDirective = 'Vocal Reaction: Express sudden, genuine shock and astonishment, with an open astonished vocal inflection! Only produce the reaction.';
+        expressionDirective = 'Vocal Reaction: Express sudden, genuine shock and astonishment, with an open astonished vocal inflection!';
       } else if (soundType === 'laugh') {
-        expressionDirective = 'Vocal Reaction: Genuinely laugh out loud with audible human laughter, chuckle, and pure amusement (not just repeating words, but real laughing vocalization). Only produce the laughter.';
+        expressionDirective = 'Vocal Reaction: Genuinely laugh out loud with audible human laughter, chuckle, and pure amusement.';
       }
 
-      prompt = `Adopt an authentic native ${dialect} voice.
-${expressionDirective}
-Do NOT read instructions. Speak ONLY the reaction text between the tags:
-<<<TEXT_TO_SPEAK_START>>>
-${text}
-<<<TEXT_TO_SPEAK_END>>>`;
+      styleMetadata = `Authentic native ${dialect} voice. ${expressionDirective}`;
     } else {
       // Speech segment with pace directive
       const pace = params.pace || 'normal';
@@ -121,18 +118,12 @@ ${text}
       if (pace === 'fast') {
         paceDirective = 'Pacing: Speak noticeably FASTER than normal, with rapid, brisk cadence and energetic quick delivery. Do not drag syllables.';
       } else if (pace === 'slow') {
-        paceDirective = 'Pacing: Speak noticeably SLOWLY and deliberately, with elongated vowels and a very calm, measured, deliberate tempo. Take your time.';
+        paceDirective = 'Pacing: Speak noticeably SLOWLY and deliberately, with elongated vowels and a very calm, measured, deliberate tempo.';
       } else {
         paceDirective = 'Pacing: Speak at a natural, comfortable conversational tempo.';
       }
 
-      prompt = `Adopt a natural native ${dialect} accent.
-Style: Natural commercial delivery.
-${paceDirective}
-IMPORTANT: The text between the markers below is ONLY content to be spoken aloud:
-<<<TEXT_TO_SPEAK_START>>>
-${text}
-<<<TEXT_TO_SPEAK_END>>>`;
+      styleMetadata = `Natural native ${dialect} accent. Style: Natural commercial delivery. ${paceDirective}`;
     }
 
     // Try keys with rotation and retry on 429
@@ -141,14 +132,33 @@ ${text}
 
     for (let attempt = 0; attempt < apiKeys.length * 2; attempt++) {
       const keyObj = apiKeys[this.currentKeyIndex % apiKeys.length];
-      const ai = new GoogleGenAI({ apiKey: keyObj.value });
+      const ai = new GoogleGenAI({
+        apiKey: keyObj.value,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
 
       try {
         const response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-tts-preview',
-          contents: [{ parts: [{ text: prompt }] }],
+          model: GEMINI_TTS_MODEL,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text,
+                  speechMetadata: {
+                    style: styleMetadata,
+                  },
+                },
+              ],
+            },
+          ],
           config: {
-            responseModalities: ['audio' as any],
+            responseModalities: ['AUDIO'],
             speechConfig: {
               voiceConfig: {
                 prebuiltVoiceConfig: { voiceName: voice }
@@ -162,7 +172,7 @@ ${text}
           throw new Error('Gemini TTS response did not contain audio data.');
         }
 
-        rawPcmBuffer = Buffer.from(base64, 'base64');
+        rawPcmBuffer = extractRawPcmFromTtsAudio(Buffer.from(base64, 'base64'));
         break;
       } catch (err: any) {
         lastError = err;

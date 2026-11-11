@@ -11,6 +11,7 @@ export const DEFAULT_META_MODEL = DEFAULT_META_CONTRIBUTOR_MODEL;
 export const DEFAULT_META_IMAGE_MODEL = DEFAULT_META_CONTRIBUTOR_MODEL;
 export const GEMINI_FALLBACK_MODEL = 'gemini-3.8-flash';
 export const GEMINI_TRANSCRIBE_MODEL = 'gemini-3.5-transcribe';
+export const GEMINI_TTS_MODEL = 'gemini-3.8-flash-tts';
 
 export function getMetaModel(): string {
   return process.env.META_MODEL || DEFAULT_META_CONTRIBUTOR_MODEL;

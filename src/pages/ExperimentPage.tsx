@@ -322,7 +322,7 @@ export default function ExperimentPage() {
             <span className="px-2.5 py-0.5 rounded-full bg-purple-500/20 border border-purple-500/40 text-purple-300 text-[10px] font-mono uppercase font-bold tracking-wider">
               Phase 1 Experiment
             </span>
-            <span className="text-white/40 text-xs font-mono">gemini-3.1-flash-tts-preview</span>
+            <span className="text-white/40 text-xs font-mono">gemini-3.8-flash-tts</span>
           </div>
           <h1 className="text-2xl font-black tracking-tight text-white flex items-center gap-2">
             <span>Experimental Expressive TTS & Timing Test</span>

@@ -90,9 +90,13 @@ export function isKeySpecificError(err: any): boolean {
     msg.includes('rate limit') ||
     msg.includes('rate_limit') ||
     msg.includes('too many requests') ||
+    msg.includes('503') ||
+    msg.includes('unavailable') ||
+    msg.includes('high demand') ||
     err.status === 429 ||
     err.status === 401 ||
-    err.status === 403
+    err.status === 403 ||
+    err.status === 503
   );
 }
 
